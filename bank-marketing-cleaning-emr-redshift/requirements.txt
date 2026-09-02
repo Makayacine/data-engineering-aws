@@ -1,0 +1,9 @@
+# Airflow scheduler side (the DAG imports these)
+apache-airflow-providers-amazon
+apache-airflow-providers-postgres
+boto3
+pandas
+
+# Spark job side -- provided by the EMR Serverless / Glue runtime in AWS,
+# needed only to run spark-jobs/ locally with --local
+pyspark==3.5.5

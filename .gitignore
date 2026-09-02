@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# local Spark job output
+_localrun/
+__verify/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# credentials — never commit
+.env
+*.pem
