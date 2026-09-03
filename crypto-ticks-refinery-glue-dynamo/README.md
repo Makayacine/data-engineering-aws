@@ -50,7 +50,8 @@ Airflow submits each Glue job with boto3 and polls `JobRunState`, following
 | `glue-ingest-bars.py` | **done** — verified at both scales, see below |
 | `refinery-walkthrough.ipynb` | **done** — 119 cells, executed, all three paths |
 | `test_ingest_bars.py` | **done** — every bar checked against a `Decimal` reference |
-| `glue-refinery-path{1,2,3}.py` | not written — prototyped in the notebook |
+| `glue-refinery-path3.py` | **done** — Steps 4–10 of the bandit path, reproduces the notebook's numbers exactly |
+| `glue-refinery-path{1,2}.py` | not written — prototyped in the notebook |
 | `glue-dynamo.py` | not written |
 | `dag-glue-workflow.py` | not written |
 | `local-docker-development.sh` | not written |
@@ -304,6 +305,97 @@ flat share. Up and down are symmetric to within 0.6 pp on every symbol at every 
 bandit is learning tick-flatness, not alpha, and the notebook says so rather than presenting a
 confident spurious result.
 
+## Running Path 3 locally
+
+Path 3 consumes **bars**, not ticks, so the entryway runs first and Path 3 reads its output:
+
+```bash
+python glue-refinery-path3.py --local     --input _localrun/bars     --output _localrun/path3
+```
+
+Three artifacts are written beneath `--output`, one per thing the path produces:
+
+| Prefix | Rows on the sample | What it is |
+| --- | --- | --- |
+| `features/` | 4,320 x 20 | the per-bar frame — Steps 5 and 6, auditable against `bars` |
+| `frame/` | 1,440 x 2 | the interaction frame — Step 7, the raw-token baskets the bans protect |
+| `arms/` | 3 x 16 | the bandit posterior — the engine's result, and `glue-dynamo.py`'s input |
+
+The arms and the bar width are **derived from the input**, not passed as flags. Both are
+properties of the frame that was actually written, and a flag is a second place for them to be
+wrong: a symbol list that disagrees with the data silently drops an arm from the pivot, and a
+declared interval that disagrees turns Step 5's stream diagnostic into a statement about
+nothing. Deriving them is also what makes the grid checks possible — the job refuses an input
+whose slots are off-grid or not dense across every symbol, because `lag()` over a sparse grid
+compares a bar against a non-adjacent one and leaves no null to notice.
+
+```bash
+python glue-refinery-path3.py --self-check
+```
+
+No Spark, no input, no output: it asserts the conjugate loop against known answers. `replay()`
+is the only non-trivial arithmetic in the job and every way it can be wrong is quiet — a wrong
+decay, an imputed `x = 0` for an unobserved reward, and ageing the arms that were not pulled all
+return a valid Beta and a plausible winner. The check pins the decay-without-increment rule, the
+exact `alpha <- gamma*alpha + x` recurrence, saturation at `1/(1-gamma)`, and seeded
+reproducibility.
+
+### What Path 3 does with each step
+
+| Step | Badge | What the job does |
+| --- | --- | --- |
+| 4 Imputation | `OVERRIDE` | carries the 8 empty bars forward as unobserved latent states; reports the five standard OHLC fills as `BANNED` by name |
+| 5 Diagnostics | `APPLIES` | stream diagnostics (19 of 4,320 arm-slots have an unobserved reward), then the reward **definition** |
+| 6 Topology | `APPLIES` | hour-of-day and minute-of-hour as sin/cos pairs |
+| 7 Feature Eng | `APPLIES` | 1,440 variable-length baskets over 28 raw string tokens |
+| 8 Pruning | `BANNED` | one-hot + VarianceThreshold prunes in ascending order of token rarity |
+| 9 Regularisation | `BANNED` | L1 zeroes the low-support/high-lift tail — and there is no `y` to regress against |
+| 10 Scaling | `BANNED` | standardising alpha/beta gives 3 of 6 shape parameters `<= 0` |
+
+A banned step is **reported, never skipped**. A step that leaves no line in the log is
+indistinguishable from a step nobody thought of, and this path's whole claim is that its three
+bans are load-bearing. The notebook runs each banned operation once on a copy to measure what it
+would cost; that demonstration is the notebook's job, and a production job that ran them would be
+doing the thing it forbids.
+
+`is_best_match` is settled here, as the entryway said Path 3 would have to. It is resolved at
+**Step 7 as a frame-construction rule, not as the banned Step 8 variance prune** — the job emits
+`<SYM>_NOT_BEST_MATCH` only for the column's *minority* state, so a token that sits in 100% of
+baskets never enters the vocabulary (it would add a constant to every support count and drag
+every lift toward 1), while the moment the column varies its rare state becomes exactly the kind
+of high-lift token the path exists to keep. A variance filter deletes a column because it does
+not vary; this rule would keep it.
+
+### Verified Path 3 run
+
+Against the committed sample, reproducing `refinery-walkthrough.ipynb` Part 4 to the last digit:
+
+```
+OVERRIDE -- Step 4 native missingness: 8 empty bars carried forward as unobserved latent states
+APPLIES  -- Step 5 stream diagnostics: 19 of 4,320 arm-slots have an unobserved reward
+APPLIES  -- Step 5 reward: '>' picks SOLUSDT, '>=' picks BTCUSDT -- the ranking inverts
+APPLIES  -- Step 7 interaction frame: 1,440 token sets, 28 distinct raw string tokens
+BANNED   -- Step 10 domain: 3 of 6 standardised shape parameters are <= 0
+APPLIES  -- Path 3 engine: 1,440 pulls, budget concentrates on SOLUSDT (41.8% over 200 seeds)
+
+arm        up%   flat%   down% | full-info rate | budget share | won the run
+BTCUSDT  36.34   27.59   36.07 |     0.3636     |    20.3%     |     5.5%
+ETHUSDT  40.24   19.03   40.73 |     0.4025     |    37.9%     |    60.0%
+SOLUSDT  41.10   18.84   40.06 |     0.4111     |    41.8%     |    34.5%
+```
+
+Glue 4.0 compatibility is checked the same way as the entryway's: all 173 post-3.3.0 wrappers are
+deleted from `pyspark.sql.functions` and the job is re-run. Output is identical — 61 log lines and
+all three Parquet payloads byte for byte. `pmod` is among the stripped names, and the job reaches
+it through `func.expr` for the same reason the entryway does.
+
+**Cost of `--seed-replicates`.** Measured: 5.4 ms per replay of 1,440 slots x 3 arms, about
+266,000 slot-steps per second on one core. The default of 200 replicates costs ~1.1 s on the
+sample and projects to **~6.7 minutes on a full month at 5s** (535,680 slots). The replay matrix
+is collected to the driver, so the job refuses more than 1,000,000 slots outright rather than
+dying in an OOM twenty minutes in — a full month at 1s is 2,678,400 slots and is refused by that
+cap, not by the timing.
+
 ## Deploying to AWS Glue 4.0
 
 Glue 4.0 is **Spark 3.3.0 / Python 3.10 / Java 8**. The job is written to that API surface, which
@@ -347,7 +439,8 @@ Note the absence of `--local`: on Glue the master comes from the cluster.
 ## Repository layout
 
 ```
-glue-ingest-bars.py            the Glue 4.0 entrypoint, Steps 1-3
+glue-ingest-bars.py            the Glue 4.0 entrypoint, Steps 1-3 (shared, path-blind)
+glue-refinery-path3.py         Steps 4-10 of the bandit path, plus --self-check
 refinery-walkthrough.ipynb     119 cells, executed: entryway, fork, all three paths
 test_ingest_bars.py            every bar vs a pure-Decimal reference
 data/sample/                   2.9 MB, 356,201 real ticks, committed
@@ -392,8 +485,14 @@ Known gaps, stated plainly:
   freezes a `NULL` into the last bar of every month, so the target is not append-only and
   January's edge needs recomputing when February lands. Targets belong to the feature layer, over
   the concatenated series.
-- **The three path jobs and the DAG are not written.** They are prototyped in the notebook, which
-  is where their design decisions and their measured numbers live.
+- **Path 1, Path 2, the DynamoDB loader and the DAG are not written.** They are prototyped in
+  the notebook, which is where their design decisions and their measured numbers live.
+  `glue-refinery-path3.py` is written and its output matches the notebook's Part 4 to the
+  last digit, including the seeded replay and the 200-seed summary.
+- **Path 3's engine is a replay, not a stream, and its reward is a modelling choice.** Both
+  are stated by the job at runtime, not just in prose: the arm ranking inverts between
+  `close > prev` and `close >= prev`, so the ordering it produces is an ordering of
+  tick-flatness rather than a trading edge. Nothing the job emits is a trading result.
 - **The Step 1 dedup is one full shuffle over 341M rows to print a line expected to read `N/A`.**
   Kept deliberately — an `N/A` the job did not measure is a lie, and Step 1's whole claim is that
   the merge is deterministic. It is the job's dominant cost. Contiguity alone cannot replace it:
