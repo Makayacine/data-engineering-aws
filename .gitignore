@@ -14,3 +14,8 @@ derby.log
 # credentials — never commit
 .env
 *.pem
+
+# crypto-ticks: raw Binance archives (2.85 GB zipped, 23.9 GB unzipped) and their extracts
+crypto-ticks-refinery-glue-dynamo/data/raw/
+crypto-ticks-refinery-glue-dynamo/data/unzipped/
+crypto-ticks-refinery-glue-dynamo/__profile_*.json
