@@ -34,7 +34,8 @@ from decimal import Decimal
 
 import pyarrow.parquet as pq
 
-JOB = "glue-ingest-bars.py"
+# Paths are relative to the PROJECT ROOT, which is where this is run from.
+JOB = "glue-jobs/glue-ingest-bars.py"
 SAMPLE_DIR = "data/sample"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 MONTH = "2025-01"

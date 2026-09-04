@@ -57,7 +57,7 @@ Airflow submits each Glue job with boto3 and polls `JobRunState`, following
 | `glue-dynamo.py` | **done** — Python shell job, 96 items; designed rather than lifted, so see *What "verified" means here* |
 | `dag-glue-workflow.py` | **done** — monthly Glue workflow, DagBag-verified on Airflow 2.9.3 |
 | `test_dag_workflow.py` | **done** — the DAG's graph and two provider assumptions, no AWS |
-| `local-docker-development.sh` | not written |
+| `local-docker-development.sh` | **done** — the whole chain inside the Glue 4.0 image, one stage per argument |
 
 ## The data
 
@@ -105,7 +105,7 @@ Needs Python 3.10+ and `pyspark==3.5.5`, plus a Java 11 or 17 JDK on `JAVA_HOME`
 support Java 21+. From the project root:
 
 ```bash
-python glue-ingest-bars.py --local \
+python glue-jobs/glue-ingest-bars.py --local \
     --input data/sample \
     --bars-output _localrun/bars \
     --bar-interval 5s \
@@ -123,7 +123,7 @@ of the data. Declaring the narrower window keeps the check meaningful at both sc
 The full month needs neither override:
 
 ```bash
-python glue-ingest-bars.py --local \
+python glue-jobs/glue-ingest-bars.py --local \
     --input data/unzipped \
     --bars-output _localrun/bars \
     --month 2025-01 --bar-interval 5s
@@ -137,7 +137,7 @@ is essentially one group per row, and eight reducers for that spill relentlessly
 ### Acceptance check
 
 ```bash
-python test_ingest_bars.py
+python tests/test_ingest_bars.py
 ```
 
 Runs the job on the committed sample, then rebuilds all 4,320 bars from the raw CSVs in pure
@@ -313,7 +313,7 @@ confident spurious result.
 Like Path 3, Path 1 consumes **bars**, so the entryway runs first:
 
 ```bash
-python glue-refinery-path1.py --local \
+python glue-jobs/glue-refinery-path1.py --local \
     --input _localrun/bars \
     --output _localrun/path1
 ```
@@ -331,7 +331,7 @@ zeroed — the ledger is more useful as "what happened to each candidate" than a
 winners.
 
 ```bash
-python glue-refinery-path1.py --self-check
+python glue-jobs/glue-refinery-path1.py --self-check
 ```
 
 No Spark. It pins the three pure decisions that would go wrong silently: the **strict** 5%
@@ -412,7 +412,7 @@ Parquet payloads byte for byte.
 Like the other two, Path 2 consumes **bars**, so the entryway runs first:
 
 ```bash
-python glue-refinery-path2.py --local \
+python glue-jobs/glue-refinery-path2.py --local \
     --input _localrun/bars \
     --output _localrun/path2
 ```
@@ -430,7 +430,7 @@ only block no candidate was fitted on — and persisting the losing candidates a
 winner is what makes that claim checkable rather than asserted.
 
 ```bash
-python glue-refinery-path2.py --self-check
+python glue-jobs/glue-refinery-path2.py --self-check
 ```
 
 No Spark. It pins the class-label bijection (get it wrong and every coefficient row is
@@ -533,7 +533,7 @@ job is about 2.5 minutes; the fit count, not the row count, is what dominates.
 Path 3 consumes **bars**, not ticks, so the entryway runs first and Path 3 reads its output:
 
 ```bash
-python glue-refinery-path3.py --local     --input _localrun/bars     --output _localrun/path3
+python glue-jobs/glue-refinery-path3.py --local     --input _localrun/bars     --output _localrun/path3
 ```
 
 Three artifacts are written beneath `--output`, one per thing the path produces:
@@ -553,7 +553,7 @@ whose slots are off-grid or not dense across every symbol, because `lag()` over 
 compares a bar against a non-adjacent one and leaves no null to notice.
 
 ```bash
-python glue-refinery-path3.py --self-check
+python glue-jobs/glue-refinery-path3.py --self-check
 ```
 
 No Spark, no input, no output: it asserts the conjugate loop against known answers. `replay()`
@@ -634,11 +634,11 @@ magnitude for the committed two-hour sample as for the full 340,971,834-tick mon
 values change.
 
 ```bash
-python glue-dynamo.py --self-check
+python glue-jobs/glue-dynamo.py --self-check
 ```
 
 ```bash
-python glue-dynamo.py --dry-run --run-id 2025-01-sample \
+python glue-jobs/glue-dynamo.py --dry-run --run-id 2025-01-sample \
     --path1 _localrun/path1 --path2 _localrun/path2 --path3 _localrun/path3
 ```
 
@@ -855,7 +855,7 @@ no AWS, no network, no Airflow metadata database:
 
 ```bash
 docker run --rm -v "${PWD}:/opt/airflow/proj" -w /opt/airflow/proj \
-  apache/airflow:2.9.3-python3.11 python test_dag_workflow.py
+  apache/airflow:2.9.3-python3.11 python tests/test_dag_workflow.py
 ```
 
 It asserts that the file parses into a DagBag with zero import errors, that the task graph is
@@ -871,6 +871,112 @@ Verified against **Airflow 2.9.3 / `apache-airflow-providers-amazon` 8.25.0** in
 image. It proves the DAG is well-formed. It proves nothing about Glue, IAM, or whether the jobs
 exist — there is no Airflow deployment behind this repository any more than there is an AWS
 account.
+
+## Running the whole chain in the Glue 4.0 image
+
+`local-docker-development.sh` runs the same five scripts inside
+`amazon/aws-glue-libs:glue_libs_4.0.0_image_01` — the image AWS ships for Glue 4.0, so
+**Spark 3.3.0 / Python 3.10 / Java 8** instead of the local Spark 3.5.5. It takes a stage:
+
+```bash
+./local-docker-development.sh              # the whole chain
+./local-docker-development.sh selfcheck    # the four --self-check modes only
+./local-docker-development.sh path2        # one leg, if an earlier run left the bars
+```
+
+Output goes to `_localrun/docker/`, never `_localrun/`, so a container run cannot overwrite what
+a native run produced. Nothing is installed: the image already carries pyspark 3.3.0+amzn.1,
+boto3 1.24.70, pyarrow 10.0.0 and numpy 1.23.5, which is every import these jobs make.
+
+Three things make it longer than the reference lab's six lines.
+
+**The five scripts are a pipeline, not a menu.** One `SCRIPT_FILE_NAME` variable can name one
+script; it cannot say that the three paths consume the entryway's bars and the loader consumes
+all three. So the default is the whole chain and a stage argument runs one leg.
+
+**They are not all Spark.** `glue-dynamo.py` is a Glue *Python shell* job, run with `python3` and
+never `spark-submit` — the same split the deployed job definitions make.
+
+**The image's ENTRYPOINT is `bash -l`, which is not an exec.** The container command is handed to
+a login shell as the name of a *script file*, so `docker run <image> python3 job.py` asks bash to
+interpret an ELF binary and exits 126 with `cannot execute binary file`; `spark-submit` survives
+only because it happens to be a shell script itself. Both therefore go through `-c`, which is
+also the form AWS's own documentation uses.
+
+Two of the lab's flags are dropped on purpose. The `~/.aws` mount and `AWS_PROFILE` buy nothing —
+every stage reads the committed sample and writes into the workspace — and on a host without a
+`~/.aws` the mount's only effect is to create one, owned by root. The Spark UI is not published
+either: these are batch jobs that exit on their own, and `-p 4040:4040` would abort the whole
+chain whenever a native `--local` run, or an orphaned JVM from a killed one, already held the
+host port. `DISABLE_SSL=true` is kept, and is not cargo cult — without it the login profile
+generates a self-signed keystore on every container start.
+
+### What the container run measured
+
+Docker Desktop gives the container **8 CPUs and 7.8 GiB** against the host's 24 cores, so the
+chain is slower than the native runs documented above, and the gap is widest on Path 2 — the
+stage whose cost is its **fit count** (24 logistic regressions at Step 9, three more at Step 10)
+rather than its row count.
+
+| Stage | Container | Native, for comparison |
+| --- | --- | --- |
+| `selfcheck` | 24 s | no Spark job runs |
+| `ingest` | 46 s | ~1 min |
+| `path1` | 3 min 43 s | ~3 min |
+| `path2` | 6 min 52 s | ~2.5 min |
+| `path3` | 1 min 33 s | ~53 s |
+| `dynamo` | 5 s | ~5 s |
+
+Run as `./local-docker-development.sh` with no argument, end to end, the whole chain measured
+**12 min 15 s** — less than the stages sum to above, because those were timed one container at a
+time from cold page cache. The native chain is ~7.5 min.
+
+Every number the jobs logged is the one this README already records from the native runs: 8 of
+4,320 bars empty at 5s, Path 1's folds 864/860/861/860/856 and CV RMSE 0.00016487 against a
+target sd of 0.00016641, Path 2's 10 of 24 coefficients zeroed and PowerTransformer at 0.4042
+over a 0.3540 majority baseline, Path 3's budget concentrating on SOLUSDT at 41.8% mean share
+while the final argmax is ETHUSDT in 60.0% of replays, and 96 items encoded by the loader.
+
+Comparing the **artifacts** rather than the logs is the stronger check, and it separates things
+the logs cannot:
+
+| Artifact | Rows | Container vs native |
+| --- | --- | --- |
+| `bars/` | 4,320 | **identical** |
+| `path1/topology/` | 289 | **identical** |
+| `path2/topology/` | 144 | **identical** |
+| `path2/scaling_search/` | 3 | **identical** |
+| `path3/arms/` | 3 | **identical** |
+| `path1/coefficients/` | 18 | all 18 differ, worst relative 9.2e-14 |
+| `path1/features/` | 4,301 | all differ, worst 1.6e-13 |
+| `path2/coefficients/` | 72 | 42 differ, worst 5.6e-14 |
+| `path2/features/` | 4,301 | all differ, worst 3.0e-13 |
+| `path3/features/` | 4,320 | 432 differ, worst 1.5e-16 — one ULP |
+| `path3/frame/` | 1,440 | 74 baskets differ **in item order only**; identical as sets |
+
+Three separate things are visible there, and it is worth not collapsing them.
+
+`bars/` coming out identical is the **`DecimalType` decision** paying off across two Spark
+versions and two core counts, not merely across shuffle widths on one machine — which is the
+harder version of the claim the entryway was built to make.
+
+The `topology/` exports coming out identical while `coefficients/` and `features/` do not is
+exactly the split the **12-decimal-place rounding** was introduced to produce. A Pearson r
+rounded to 12 dp survives a change of Spark version and core count; an unrounded fitted parameter
+does not, and is deliberately left that way, because masking a float difference in a model
+coefficient is not the same act as trimming meaningless precision off a diagnostic. The observed
+drift, ~1e-13 relative, is the size that argument predicts.
+
+`path3/frame/` is the one genuinely new finding. Its rows are identical as **sets** — every
+basket holds the same tokens — but 74 of 1,440 have them in a different order, because the frame
+is built with `collect_list` over a shuffle whose order Spark does not promise. Harmless to the
+consumer, since a market basket is a set and the bans that protect it are about membership; but
+it does mean `frame/` is not checksummable the way `topology/` was deliberately made to be.
+
+What this does **not** prove: the image is Glue's runtime, not Glue. It pins the same Spark,
+Python and Java and carries AWS's own jar set, which is what the strip test only simulates — but
+it runs `local[*]` on a laptop, with no cluster, no S3, no IAM, no job bookmarks and no
+`GlueContext`.
 
 ## Deploying to AWS Glue 4.0
 
@@ -905,16 +1011,18 @@ two ways cannot attribute what it finds.
 Two limits worth stating. The scan is **class-level**, so a post-3.3.0 *parameter* on a
 pre-3.3.0 class would slip through; the ones the path jobs lean on were checked by hand and both
 landed in 3.1.0 (`CrossValidator.foldCol`, `VarianceThresholdSelector`). And it runs against
-local Spark, so it catches a missing API name and nothing about Glue's runtime or IAM behaviour.
+local Spark, so it catches a missing API name and nothing about Glue's runtime or IAM behaviour —
+for the stronger version of that check, where all five jobs run on real Spark 3.3.0, see
+*Running the whole chain in the Glue 4.0 image* above.
 
 Upload and create the jobs:
 
 ```bash
-aws s3 cp glue-ingest-bars.py    s3://<bucket>/crypto_ticks/scripts/
-aws s3 cp glue-refinery-path1.py s3://<bucket>/crypto_ticks/scripts/
-aws s3 cp glue-refinery-path2.py s3://<bucket>/crypto_ticks/scripts/
-aws s3 cp glue-refinery-path3.py s3://<bucket>/crypto_ticks/scripts/
-aws s3 cp refinery_common.py     s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-jobs/glue-ingest-bars.py    s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-jobs/glue-refinery-path1.py s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-jobs/glue-refinery-path2.py s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-jobs/glue-refinery-path3.py s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-jobs/refinery_common.py     s3://<bucket>/crypto_ticks/scripts/
 ```
 
 Create a Glue job of type Spark, Glue version 4.0, pointing at each script, with an IAM role
@@ -972,7 +1080,7 @@ On-demand billing because the write pattern is 96 items once a month: provisioni
 that means paying by the hour for a table that is idle by the hour.
 
 ```bash
-aws s3 cp glue-dynamo.py s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-jobs/glue-dynamo.py s3://<bucket>/crypto_ticks/scripts/
 
 aws glue start-job-run --job-name crypto-ticks-load-dynamo \
   --arguments '{
@@ -992,20 +1100,35 @@ as puts. No `CreateTable`, and nothing on any other table.
 ## Repository layout
 
 ```
-glue-ingest-bars.py            the Glue 4.0 entrypoint, Steps 1-3 (shared, path-blind)
-refinery_common.py             verdict(), build_session(), load_bars() -- shared by the paths
-glue-refinery-path1.py         Steps 4-10 of the continuous path, plus --self-check
-glue-refinery-path2.py         Steps 4-10 of the categorical path, plus --self-check
-glue-refinery-path3.py         Steps 4-10 of the bandit path, plus --self-check
-glue-dynamo.py                 Python shell job: the three ledgers -> DynamoDB, plus --self-check
-dag-glue-workflow.py           Airflow: the monthly workflow, ingest -> fork -> load
-test_dag_workflow.py           DagBag check for the DAG -- graph, wait_for_completion, templating
+glue-jobs/                     everything Glue runs, and nothing else
+  glue-ingest-bars.py            the Glue 4.0 entrypoint, Steps 1-3 (shared, path-blind)
+  refinery_common.py             verdict(), build_session(), load_bars() -- shared by the paths
+  glue-refinery-path1.py         Steps 4-10 of the continuous path, plus --self-check
+  glue-refinery-path2.py         Steps 4-10 of the categorical path, plus --self-check
+  glue-refinery-path3.py         Steps 4-10 of the bandit path, plus --self-check
+  glue-dynamo.py                 Python shell job: the three ledgers -> DynamoDB, plus --self-check
+airflow-dag/
+  dag-glue-workflow.py           Airflow: the monthly workflow, ingest -> fork -> load
+tests/
+  test_ingest_bars.py            every bar vs a pure-Decimal reference
+  test_dag_workflow.py           DagBag check for the DAG -- graph, wait_for_completion, templating
+local-docker-development.sh    the whole chain inside the Glue 4.0 image, one stage per argument
 refinery-walkthrough.ipynb     119 cells, executed: entryway, fork, all three paths
-test_ingest_bars.py            every bar vs a pure-Decimal reference
 data/sample/                   2.9 MB, 356,201 real ticks, committed
 data/raw/                      gitignored -- the three source zips
 data/unzipped/                 gitignored -- 25.6 GB extracted
 ```
+
+`glue-jobs/` is one folder rather than a `spark-jobs/` and a `python-shell-jobs/`, because the
+split that matters is enforced where it has consequences — `local-docker-development.sh` and the
+DAG each run `glue-dynamo.py` differently — and a folder boundary asserting the same thing a
+second time is one more place for the two to disagree. The five path and entryway scripts are
+siblings for a load-bearing reason: Python puts the running script's directory on `sys.path`, so
+`import refinery_common` resolves next to the job, which is what makes `--extra-py-files` a
+deployment concern rather than a local one.
+
+Every command in this README is written to be run **from the project root** — the notebook, the
+tests and the shell script all use root-relative paths.
 
 ## Notes and known gaps
 
@@ -1037,9 +1160,11 @@ Five things in the job are load-bearing and easy to break.
 
 Known gaps, stated plainly:
 
-- **Nothing here has been run on AWS.** Glue 4.0 compatibility is verified by simulating the
-  Spark 3.3.0 API surface locally, which catches missing Python wrappers but not runtime or IAM
-  behaviour. The `--month` argument makes the job single-month; a backfill loops it.
+- **Nothing here has been run on AWS.** All five jobs now run end to end inside AWS's own Glue
+  4.0 image — real Spark 3.3.0, Python 3.10 and Java 8, not the locally simulated API surface the
+  strip test checks — but that image is a laptop running `local[*]`: no cluster, no S3, no IAM,
+  no job bookmarks and no `GlueContext`. The `--month` argument makes the job single-month; a
+  backfill loops it.
 - **Targets are not computed by the entryway**, deliberately. A next-bar return computed per month
   freezes a `NULL` into the last bar of every month, so the target is not append-only and
   January's edge needs recomputing when February lands. Targets belong to the feature layer, over
@@ -1054,7 +1179,6 @@ Known gaps, stated plainly:
   import errors and its graph and operator settings are asserted by `test_dag_workflow.py`
   against Airflow 2.9.3, but no Airflow deployment exists behind this repository, so nothing
   here has been scheduled, triggered or retried in anger.
-- **`local-docker-development.sh` is not written.** It is the last file.
 - **The correlation exports are rounded to 12 decimal places.** `Correlation.corr` is a float
   aggregate over partitions and float addition is not associative, so the last ULP of a *pooled*
   cell depends on how the work was scheduled — measured at up to `1.11e-16` across two launch

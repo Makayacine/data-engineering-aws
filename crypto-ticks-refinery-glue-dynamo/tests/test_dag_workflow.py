@@ -47,13 +47,14 @@ EXPECTED_EDGES = {
 def load_dag():
     """Parse the DAG file itself, and fail loudly on any import error.
 
-    The file, not the folder. This project has a flat layout, so the folder also holds four
-    Glue job scripts that import pyspark, pyarrow and boto3 -- none of which a scheduler needs
-    and DagBag would try to parse anything whose text mentions both "airflow" and "dag". Only
-    dag-glue-workflow.py is ever deployed to a dags/ folder, so only it is what this parses.
+    The file, not the folder, and it stays that way now that `airflow-dag/` holds nothing
+    else. DagBag parses anything whose text mentions both "airflow" and "dag", so aimed at a
+    folder it would eventually pick up a neighbour: naming the one file that is ever deployed
+    to a scheduler's dags/ folder is the assertion, not an artefact of how the repo is laid out.
     """
     here = os.path.dirname(os.path.abspath(__file__))
-    bag = DagBag(dag_folder=os.path.join(here, DAG_FILE), include_examples=False)
+    dag_path = os.path.join(here, os.pardir, 'airflow-dag', DAG_FILE)
+    bag = DagBag(dag_folder=dag_path, include_examples=False)
     # import_errors is the assertion that matters most: a DAG whose module raises on import is
     # not a broken DAG, it is an ABSENT one -- the scheduler logs it and the UI shows nothing,
     # which looks identical to never having deployed the file.
