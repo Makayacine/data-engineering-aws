@@ -54,7 +54,7 @@ Airflow submits each Glue job with boto3 and polls `JobRunState`, following
 | `glue-refinery-path3.py` | **done** — Steps 4–10 of the bandit path, reproduces the notebook's numbers exactly |
 | `glue-refinery-path1.py` | **done** — Steps 4-10 of the continuous path, reproduces the notebook's numbers exactly |
 | `glue-refinery-path2.py` | **done** — Steps 4-10 of the categorical path, reproduces the notebook's numbers exactly |
-| `glue-dynamo.py` | not written |
+| `glue-dynamo.py` | **done** — Python shell job, 96 items; designed rather than lifted, so see *What "verified" means here* |
 | `dag-glue-workflow.py` | not written |
 | `local-docker-development.sh` | not written |
 
@@ -619,6 +619,172 @@ is collected to the driver, so the job refuses more than 1,000,000 slots outrigh
 dying in an OOM twenty minutes in — a full month at 1s is 2,678,400 slots and is refused by that
 cap, not by the timing.
 
+## Loading DynamoDB
+
+`glue-dynamo.py` publishes the three path ledgers to one DynamoDB table. It is a Glue **Python
+shell** job, not Spark: the three artifacts are 18, 72 and 3 rows — about 12 KB of Parquet
+between them — and a Spark job would spend two and a half minutes starting a cluster to move
+them. Nothing in the file imports pyspark, so the Glue 4.0 strip test that gates the three path
+jobs does not apply to it.
+
+The item count is set by the *shape* of the refinery, not by how much data went through it: it is
+one item per surviving feature, per (feature, class) cell and per arm, so it is the same order of
+magnitude for the committed two-hour sample as for the full 340,971,834-tick month. Only the
+values change.
+
+```bash
+python glue-dynamo.py --self-check
+```
+
+```bash
+python glue-dynamo.py --dry-run --run-id 2025-01-sample \
+    --path1 _localrun/path1 --path2 _localrun/path2 --path3 _localrun/path3
+```
+
+Both run with **no AWS account, no credentials and no region configured**. Each `--path*` is that
+path job's `--output` prefix; the loader appends the artifact name it knows that path writes.
+Paths are independent, so a single path that was re-run can be re-published on its own.
+
+### The table
+
+| | |
+| --- | --- |
+| partition key | `pk` (S) — `<run-id>#<path>`, e.g. `2025-01#path1` |
+| sort key | `sk` (S) — the grain within that path |
+
+| Source | Rows | Items | Sort key | Example |
+| --- | --- | --- | --- | --- |
+| `path1/coefficients` | 18 | 1 + 18 | `feature#<name>` | `feature#imbalance` |
+| `path2/coefficients` | 72 | 1 + 72 | `feature#<name>#class_name#<class>` | `feature#imbalance#class_name#down` |
+| `path3/arms` | 3 | 1 + 3 | `symbol#<symbol>` | `symbol#BTCUSDT` |
+
+96 items on the sample. One partition is exactly one path's result from exactly one run, so
+*give me Path 1's ledger for 2025-01* is a single `Query` on the partition key, and
+`begins_with(sk, "feature#imbalance#")` is one Path 2 feature's three class rows. The sort key
+alternates the artifact's own column names with their values, so it reads back against the
+Parquet it came from without a translation table. The `#model` header item sorts before every
+grain key — `#` is `0x23` and every grain prefix starts with a letter — so a Query returns it
+first without being asked to.
+
+The separator is safe **by measurement**: all 47 distinct grain tokens across the three artifacts
+are `[A-Za-z0-9_]`, none contains a `#`, and the longest is 47 characters. The loader raises on a
+grain value containing one rather than emitting a key that would silently collide.
+
+Three parts of that are judgement calls rather than deductions:
+
+- **The run id is in the partition key.** A rerun of the same run is idempotent — same keys, same
+  overwrite — while a new run writes a new partition instead of mutating the old one. The
+  alternative, a table holding only "current" with history left in S3, is smaller and defensible;
+  it was rejected because a month whose Step 8 keeps fewer features than the last one leaves the
+  dropped features behind as items that still claim to be current. The key alone does not fix
+  that — `put_item` cannot delete — so after writing each partition the job **reads it back and
+  removes whatever this run did not produce**, logging every deletion by name. An earlier draft
+  only counted and logged a warning, which is the shape of fix that reads as diligence and
+  changes nothing: the job still exits 0, Airflow still goes green, and the stale item is still
+  served. Deleting is safe here precisely because the partition is keyed `<run-id>#<path>`, so
+  everything in it was written by a previous run of this job for this run id and this path.
+- **The run id is supplied, not derived.** Path 3 derives its arms and its bar width from the
+  input on the grounds that a flag is a second place for them to be wrong. That argument cannot
+  be made here: the three artifacts carry no month, no calendar and no run identity of any kind,
+  so there is nothing to derive one from. `--run-id` is therefore required and has no default,
+  which at least makes the second place a visible one.
+- **The model-level columns are lifted onto a header item.** `reg_param`, `elastic_net_param`,
+  `intercept`, `cv_rmse`, `target_sd` and `n_rows` are identical on all 18 Path 1 rows, and
+  `reg_param`, `elastic_net_param` and `baseline_accuracy` on all 72 Path 2 rows. Parquet repeats
+  them because Parquet is rectangular and has nowhere else to put them; DynamoDB is not and does.
+  The job **checks** they are constant before lifting them, rather than trusting the list: if a
+  future run made one per-row, lifting it would publish one row's value as the model's and delete
+  the other seventeen without a word.
+
+There is no `LATEST` pointer item, no GSI and no run manifest. *Give me the current model*
+therefore requires the caller to know the run id, and *how did this coefficient move over twelve
+months* is twelve Queries. Both are the right upgrade the day something downstream actually asks
+— Part II and the gates were never written, so today they would be structure built for a consumer
+that does not exist. A `#complete` manifest item was considered for the same reason and dropped
+for a sharper one: Glue's own `JobRunState` already tells Airflow whether the load finished, and
+with the sweep in place a load interrupted half way is repaired by the rerun rather than needing
+to be detected first.
+
+### DynamoDB rejects `float`, and rejects it at write time
+
+The same shape of trap as the `numpy.float64` that killed Path 2's first write, and the same
+cost: the type error is raised after every step of the refinery has already been paid for.
+Measured against boto3 1.39.11's `TypeSerializer`:
+
+| Value | Result |
+| --- | --- |
+| `0.1` | `TypeError` — "Float types are not supported. Use Decimal types instead" |
+| `Decimal(0.1)` | `decimal.Inexact` — the exact binary value is 55 significant digits and `DYNAMODB_CONTEXT` has `prec=38` |
+| `Decimal(str(0.1))` | `{'N': '0.1'}` — correct |
+| `numpy.float64(0.1)` | `TypeError` — a `float` subclass, caught by the float check |
+| `numpy.int64(212)` | `TypeError` — "Unsupported type" |
+| `numpy.bool_(True)` | `TypeError` — "Unsupported type"; numpy 2.x `bool_` is **not** a `bool` subclass |
+| `Decimal(str(float("nan")))` | `TypeError` — "Infinity and NaN not supported" |
+| `Decimal("1E-131")`, `Decimal("1E126")` | **encoded without complaint** — and DynamoDB rejects both |
+
+That last row is the one that matters to the verification argument. DynamoDB's number range is
+`1E-130` to `9.9999…E125`; boto3's serializer does not enforce it, so there is a band where
+`--dry-run` comes out green and the real write fails. `attribute()` therefore checks the
+magnitude itself. It is unreachable on today's artifacts — they span `1.36e-08` to `4301.0` —
+but "if it would be rejected, it is rejected on a laptop" is either true or it is not.
+(`5e-324` is *not* in that band: boto3 raises `Underflow`, because a denormal's exponent falls
+below `DYNAMODB_CONTEXT`'s `Etiny`.)
+
+Two consequences run through the whole file.
+
+**The Parquet is read with pyarrow, not pandas.** `pyarrow.Table.to_pylist()` returns native
+`str` / `int` / `float` / `bool` and `None` for a null. `pandas.read_parquet` returns numpy
+scalars — every one of which the table above rejects — and turns a null `float64` into `NaN`,
+which is a *different* rejection with a different message. Path 1's `mu`, `sigma` and `bp_per_sd`
+are null on the 12 features Step 9 zeroed, so the pandas route hits that on the first artifact.
+`Decimal(str(x))` loses nothing: Python's float `repr` has been the shortest round-tripping
+string since 3.1, and all 543 float cells in the three artifacts satisfy
+`float(Decimal(str(x))) == x`.
+
+**A null becomes an absent attribute**, not a `NULL` and not a zero. The feature has no `sigma`
+because Step 9 zeroed it and Step 10 never scaled it; absent is the honest encoding and the one
+that costs nothing to store.
+
+### What "verified" means here, and what it does not
+
+The three path jobs each reproduce a notebook Part to the last digit. `refinery-walkthrough.ipynb`
+stops at the three paths, so **this job has no prototype and no oracle**. What replaces one is
+narrower, and worth naming exactly:
+
+1. **Every item is encoded by the real encoder before anything is sent.** `--dry-run` builds
+   every item from the real artifacts and passes each through
+   `boto3.dynamodb.types.TypeSerializer` — not a mock and not a re-implementation, but the exact
+   code the DynamoDB client runs on the way to the wire. An item that would be rejected for its
+   types is rejected on a laptop, before the refinery is paid for.
+2. **The keys are proved unique at build time.** A duplicate `(pk, sk)` is the one failure here
+   that destroys data without raising: `batch_writer` de-duplicates nothing, a repeated key
+   inside one batch is a `ValidationException`, and a repeated key *across* batches is a silent
+   overwrite that would turn 72 rows into 24 items with no error and no warning. Not
+   hypothetical: **`imbalance` is a feature name in Path 1's ledger and in Path 2's** — the only
+   name the two share — so a key built from the feature name alone would have those two rows
+   fighting over one item today. Putting the path in the *partition* key is what keeps them
+   apart, which is the reason for it rather than a pleasant side effect.
+3. **`--self-check` pins the pure decisions** — `bool` checked before `int` (`isinstance(True,
+   int)` is `True`, so the wrong order writes `survived_step9` as the number `1`, and `== True`
+   cannot catch it because `1 == True`), the `Decimal(str(x))` round trip, `NaN`/`inf` refused
+   with the column name attached, nulls omitted, Path 2's two-part grain, the `#` guard, and the
+   constant-column proof. No AWS, no network, no input.
+
+**None of that proves** the table exists, that its key schema matches, that the IAM role can
+write to it, that the region is right, or that the throughput holds. Those need an account.
+
+**Why not moto or localstack.** Both were considered and neither is used. moto reimplements
+DynamoDB in Python, so a green moto run is evidence about moto; the parts it would add on top of
+the serializer — does the table exist, is its key schema the one this job assumes — are exactly
+the parts a fake table cannot vouch for, because the test creates the fake table. That is a new
+test dependency bought for a weaker guarantee than the one boto3 already ships.
+
+One thing this job found that nothing upstream could: it is the first place all three artifacts
+meet, and they disagree. `survived_step9` is a genuine boolean on Path 1 and the strings
+`"True"`/`"False"` on Path 2. The loader logs the disagreement and ships both as written —
+retyping one here would make the table disagree with the Parquet it came from, and if an encoding
+is wrong then the path that wrote it is what needs fixing.
+
 ## Deploying to AWS Glue 4.0
 
 Glue 4.0 is **Spark 3.3.0 / Python 3.10 / Java 8**. The job is written to that API surface, which
@@ -695,6 +861,47 @@ aws glue start-job-run --job-name crypto-ticks-ingest-bars \
 
 Note the absence of `--local`: on Glue the master comes from the cluster.
 
+### The loader is a different kind of Glue job
+
+`glue-dynamo.py` is a **Python shell** job, not a Spark one — a different job type in the console
+and a different set of things that can go wrong. It needs no `--extra-py-files`, no
+`--bar-interval`, no Glue version pin against Spark 3.3.0, and it does not take `--local`: there
+is no master to set, so the only thing that changes between a laptop and Glue is whether the
+`--path*` arguments start with `s3://`.
+
+The table is **not** created by the job. A loader that creates tables is a loader holding IAM
+permissions it has no other use for, and the key schema is a design decision that should live
+somewhere a reviewer can see it, not inside a `try/except ResourceNotFoundException`:
+
+```bash
+aws dynamodb create-table \
+  --table-name crypto_ticks_refinery \
+  --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
+  --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST
+```
+
+On-demand billing because the write pattern is 96 items once a month: provisioning capacity for
+that means paying by the hour for a table that is idle by the hour.
+
+```bash
+aws s3 cp glue-dynamo.py s3://<bucket>/crypto_ticks/scripts/
+
+aws glue start-job-run --job-name crypto-ticks-load-dynamo \
+  --arguments '{
+    "--run-id":"2025-01",
+    "--table":"crypto_ticks_refinery",
+    "--path1":"s3://<bucket>/crypto_ticks/curated/path1/",
+    "--path2":"s3://<bucket>/crypto_ticks/curated/path2/",
+    "--path3":"s3://<bucket>/crypto_ticks/curated/path3/"
+  }'
+```
+
+The job's IAM role needs `s3:GetObject` and `s3:ListBucket` on the curated prefixes, and
+`dynamodb:BatchWriteItem` plus `dynamodb:Query` on the one table — `Query` for the read-back that
+finds orphans, and `BatchWriteItem` for both halves of the sweep, since it covers deletes as well
+as puts. No `CreateTable`, and nothing on any other table.
+
 ## Repository layout
 
 ```
@@ -703,6 +910,7 @@ refinery_common.py             verdict(), build_session(), load_bars() -- shared
 glue-refinery-path1.py         Steps 4-10 of the continuous path, plus --self-check
 glue-refinery-path2.py         Steps 4-10 of the categorical path, plus --self-check
 glue-refinery-path3.py         Steps 4-10 of the bandit path, plus --self-check
+glue-dynamo.py                 Python shell job: the three ledgers -> DynamoDB, plus --self-check
 refinery-walkthrough.ipynb     119 cells, executed: entryway, fork, all three paths
 test_ingest_bars.py            every bar vs a pure-Decimal reference
 data/sample/                   2.9 MB, 356,201 real ticks, committed
@@ -747,8 +955,13 @@ Known gaps, stated plainly:
   freezes a `NULL` into the last bar of every month, so the target is not append-only and
   January's edge needs recomputing when February lands. Targets belong to the feature layer, over
   the concatenated series.
-- **The DynamoDB loader and the DAG are not written.** All three path jobs are, and each
-  matches its notebook Part to the last digit.
+- **Nothing has ever touched a real DynamoDB table.** `glue-dynamo.py` is written and its items
+  are built and encoded by boto3's own serializer against the real artifacts, but this repository
+  has no AWS account behind it, no table named in it has ever existed, and the job has never
+  opened a connection. It is also the one file here with no notebook prototype to diff against —
+  the walkthrough stops at the three paths — so it is designed rather than lifted, and the table
+  schema is a judgement call rather than a reproduction. See *What "verified" means here*.
+- **The DAG is not written.** `dag-glue-workflow.py` and `local-docker-development.sh` remain.
 - **The correlation exports are rounded to 12 decimal places.** `Correlation.corr` is a float
   aggregate over partitions and float addition is not associative, so the last ULP of a *pooled*
   cell depends on how the work was scheduled — measured at up to `1.11e-16` across two launch
