@@ -53,7 +53,7 @@ Airflow submits each Glue job with boto3 and polls `JobRunState`, following
 | `test_ingest_bars.py` | **done** — every bar checked against a `Decimal` reference |
 | `glue-refinery-path3.py` | **done** — Steps 4–10 of the bandit path, reproduces the notebook's numbers exactly |
 | `glue-refinery-path1.py` | **done** — Steps 4-10 of the continuous path, reproduces the notebook's numbers exactly |
-| `glue-refinery-path2.py` | not written — prototyped in the notebook |
+| `glue-refinery-path2.py` | **done** — Steps 4-10 of the categorical path, reproduces the notebook's numbers exactly |
 | `glue-dynamo.py` | not written |
 | `dag-glue-workflow.py` | not written |
 | `local-docker-development.sh` | not written |
@@ -401,13 +401,131 @@ The CV RMSE of 0.00016487 against a target sd of 0.00016641 is a 0.9% improvemen
 the mean. That is the honest read of it, and it is roughly what a next-bar return on 5-second
 crypto bars should look like.
 
-Glue 4.0 compatibility is checked by the same strip test as the other two jobs, **extended to
-`pyspark.ml`** because Path 1 is the first path that uses it: 174 names deleted (173 from
-`pyspark.sql.functions`, `predict_batch_udf` from `pyspark.ml.functions`), then re-run and
-diffed. Output identical — 123 log lines and all three Parquet payloads byte for byte. The test
-scans **classes**, so a post-3.3.0 *parameter* on a pre-3.3.0 class would slip through it; the
-two this job leans on were checked by hand and both landed in 3.1.0
-(`CrossValidator.foldCol`, `VarianceThresholdSelector`).
+Glue 4.0 compatibility is checked by the strip test described under **Deploying**, **extended
+to `pyspark.ml`** because Path 1 is the first path that uses it: 174 names deleted, control and
+treatment through the same harness, then diffed. Output identical — 123 log lines and all three
+Parquet payloads byte for byte.
+
+## Running Path 2 locally
+
+Like the other two, Path 2 consumes **bars**, so the entryway runs first:
+
+```bash
+python glue-refinery-path2.py --local \
+    --input _localrun/bars \
+    --output _localrun/path2
+```
+
+| Prefix | Rows on the sample | What it is |
+| --- | --- | --- |
+| `features/` | 4,301 x 29 | the scaled matrix Part II consumes |
+| `topology/` | 144 x 4 | Step 6's dependency schema — pooled **and** per symbol |
+| `coefficients/` | 72 x 8 | the k x p Step 9 matrix in long form, `glue-dynamo.py`'s input |
+| `scaling_search/` | 3 x 5 | the Step 10 evidence: every candidate, its holdout accuracy, and whether Spark actually ships it |
+
+`scaling_search/` exists because the framework mandates a *search* and never states its
+criterion. The criterion used here is **held-out accuracy on the last 20% of the window** — the
+only block no candidate was fitted on — and persisting the losing candidates alongside the
+winner is what makes that claim checkable rather than asserted.
+
+```bash
+python glue-refinery-path2.py --self-check
+```
+
+No Spark. It pins the class-label bijection (get it wrong and every coefficient row is
+attributed to the wrong class — the accuracy is unchanged and only the interpretation is
+destroyed) and the fold geometry: `fold_cut` monotone over four spans, and three expanding fold
+blocks that all end at or before the dev/holdout boundary. That last assert is the one that
+matters — edit `FOLD_BLOCKS` to `(0.8, 0.9)` and Step 9 would validate on the block Step 10
+later scores on, so both numbers would be optimistic and neither would look wrong.
+
+### What Path 2 does with each step
+
+| Step | Badge | What the job does |
+| --- | --- | --- |
+| 4 Imputation | `APPLIES` | median impute **per symbol**; the missing category gets a name |
+| 5 Diagnostics | `APPLIES` | class balance — read-only, and asserted so |
+| 6 Topology | `APPLIES` | cross-correlation **and** cyclical sin/cos coordinates |
+| 7 Feature Eng | `APPLIES` | numeric cross-products **and** a categorical x categorical product |
+| 8 Pruning | `ENFORCE` | one-hot encoding **before** variance pruning |
+| 9 Regularisation | `APPLIES` | multinomial Elastic Net over expanding time-blocked folds |
+| 10 Scaling | `APPLIES` | quantile search across three candidate transforms |
+
+**Step 4's grouping is the trap.** A single median over the frame blends three price scales
+(BTC ~ $94k, ETH ~ $3.3k, SOL ~ $190) and would hand an empty ETH bar a five-figure close. The
+framework's NexusMart matrix has one cohort per run and never has to state this; bar data does.
+Note also that Path 2 has **no** 5% firewall — that is a Path 1 rule, and the framework runs
+the Path 2 branch at 3.1% missing with no threshold test at all — so the rate is reported and
+not acted on.
+
+**Step 6 is read-only on Path 1 but not on Path 2.** The same grid cell also mandates cyclical
+coordinate spaces, and those are columns. The correlation matrix is computed **pooled and per
+symbol**, because a "global" matrix over a frame holding three symbols is largely a matrix of
+*between-symbol scale differences*: 10 pair-symbol combinations flip sign against the pooled
+figure, and 5 per-symbol cells are undefined outright because a symbol with no empty bars has a
+constant `is_missing_bar` and therefore a zero denominator. The pooled matrix conceals that by
+borrowing the other symbols' variance.
+
+**Step 8's ENFORCE is about order, and the order is priced.** Both operations happen either
+way; what changes is the granularity the variance filter can act at. Encode-first prunes at
+**level** granularity, so `ETHUSDT__SYSTEM_STATE_UNKNOWN` lives or dies on its own. Prune-first
+prunes at **column** granularity — and what it measures to decide is the variance of index
+*codes*, which the job measures both ways on identical data: **0.6765** under the default
+`frequencyDesc` ordering and **2.6664** under `alphabetAsc`. Same 4,320 rows, different
+numbering, different keep/drop decision. That counterfactual is read-only; the job never runs
+the banned order.
+
+**The honest bookend on the ENFORCE.** On this data the preserved level cannot pay off. The
+empty bars are precisely the rows whose target is unobservable, so the `SYSTEM_STATE_UNKNOWN`
+dummies are all-zero on the labelled frame Step 9 trains against, and Elastic Net zeroes both.
+The mandate is still right — it is what keeps the level addressable — but a subgroup finding
+was not measured here and is not claimed.
+
+### Verified Path 2 run
+
+Against the committed sample, reproducing `refinery-walkthrough.ipynb` Part 3 to the last digit:
+
+```
+APPLIES  -- Step 4 numerics: 64 nulls across 8 columns median-imputed per symbol, 0 remain
+APPLIES  -- Step 4 categoricals: SYSTEM_STATE_UNKNOWN assigned to 8 rows, 0 dropped
+APPLIES  -- Step 5 class balance: k=3, pooled flat share 21.83% of 4,301 labelled rows
+ENFORCE  -- Step 8: prune-first's criterion moves 0.6765 -> 2.6664 on identical data
+APPLIES  -- Step 9 CV: random folds score higher on 4 of 4 grid points -- the leak, not a better model
+APPLIES  -- Step 10: PowerTransformer (signed log1p) wins at 0.4042 over 3 candidates
+
+  regParam  elasticNet   time-ordered CV   random-fold CV      gap
+      0.01         0.5            0.4102           0.4448  +0.0346
+      0.01         1.0            0.4079           0.4433  +0.0355
+       0.1         0.5            0.3598           0.4058  +0.0460
+       0.1         1.0            0.3598           0.4058  +0.0460
+
+candidate                                 holdout accuracy   vs baseline
+PowerTransformer (signed log1p)                     0.4042       +0.0502
+StandardScaler                                      0.4007       +0.0467
+QuantileTransformer (percent_rank)                  0.3972       +0.0432
+(majority-class baseline)                           0.3540
+```
+
+**The random folds beat the time-ordered folds on every single grid point.** That gap — +0.035
+to +0.046 — is the leak, measured rather than asserted. Spark's `CrossValidator` builds random
+folds by default, and on ordered bars that trains on the future *and* splits near-duplicate
+adjacent bars across the boundary. The framework says "cross-validated" and never mentions
+temporal ordering, because NexusMart's rows are exchangeable sessions and bars are not.
+
+**Two of the three Step 10 legs are substitutions, and `scaling_search/` says which.** Spark
+ships neither `PowerTransformer` (no Yeo-Johnson, no Box-Cox) nor `QuantileTransformer` (no
+rank-to-uniform map). The stand-ins are a signed `log1p` — monotone, sign-preserving,
+Yeo-Johnson at lambda=0 with no lambda search — and `percent_rank` over an unpartitioned
+window. The second also cannot carry the training quantiles across to the holdout the way a
+real `QuantileTransformer` would, and it collapses to one executor per column, so above
+`MAX_QUANTILE_ROWS` (250,000) the job **skips that leg and says so** rather than stalling. The
+winning transform is *not* the one written to `features/`: `StandardScaler` is, because it is
+the only leg that can be refitted reproducibly on next month's bars. The search result is
+persisted next to it so the choice is visible rather than silently overridden.
+
+**Cost.** Step 9 fits `len(REG_PARAMS) x len(ELASTIC_NET_PARAMS) x (3 ordered + 3 random)` = 24
+logistic regressions at `maxIter=50`, and Step 10 fits 3 more. On the committed sample the whole
+job is about 2.5 minutes; the fit count, not the row count, is what dominates.
 
 ## Running Path 3 locally
 
@@ -488,10 +606,11 @@ ETHUSDT  40.24   19.03   40.73 |     0.4025     |    37.9%     |    60.0%
 SOLUSDT  41.10   18.84   40.06 |     0.4111     |    41.8%     |    34.5%
 ```
 
-Glue 4.0 compatibility is checked the same way as the entryway's: all 173 post-3.3.0 wrappers are
-deleted from `pyspark.sql.functions` and the job is re-run. Output is identical — 61 log lines and
-all three Parquet payloads byte for byte. `pmod` is among the stripped names, and the job reaches
-it through `func.expr` for the same reason the entryway does.
+Glue 4.0 compatibility is checked by the strip test described under **Deploying**: 174
+post-3.3.0 names deleted, control and treatment through the same harness, then diffed. Output is
+identical — 61 log lines and all three Parquet payloads byte for byte. `pmod` is among the
+stripped names, and the job reaches it through `func.expr` for the same reason the entryway
+does.
 
 **Cost of `--seed-replicates`.** Measured: 5.4 ms per replay of 1,440 slots x 3 arms, about
 266,000 slot-steps per second on one core. The default of 200 replicates costs ~1.1 s on the
@@ -516,17 +635,31 @@ reaches it. `min_by`/`max_by` are genuinely 3.3.0 and are called directly, and `
 (3.4.0) has no `expr()` fallback at all — Path 3 uses explode-then-filter instead.
 
 This is verified by execution, not by reading release notes: every name whose `versionadded`
-exceeds 3.3.0 is deleted from `pyspark.sql.functions` **and from `pyspark.ml`**, then the job is
-re-run and diffed. Output is byte-identical in every case. The test scans **classes**, so a
-post-3.3.0 *parameter* on a pre-3.3.0 class would slip through it; the two the path jobs lean on
-were checked by hand and both landed in 3.1.0 (`CrossValidator.foldCol`,
-`VarianceThresholdSelector`).
+exceeds 3.3.0 is deleted from `pyspark.sql.functions` **and from `pyspark.ml`** (174 names), then
+the job is re-run and diffed. All three path jobs come out byte-identical — logs and every
+Parquet payload.
+
+**The baseline runs through the same harness.** An earlier version of this test compared
+`python job.py` against a stripped run launched via `runpy.run_path`, and that comparison
+reported a difference on Path 2: 16 of 144 correlation cells moved by up to `1.11e-16`, which
+then propagated into an iterative optimiser's coefficients. It was measured down to its cause —
+running the job *unstripped* through the same `runpy` harness reproduced the difference exactly,
+and two runs of each launch method agreed with themselves — so the culprit was the **launch
+method, not the stripping**. The harness therefore has a `--no-strip` control mode, and baseline
+and stripped now differ in exactly one thing. A test whose control differs from its treatment in
+two ways cannot attribute what it finds.
+
+Two limits worth stating. The scan is **class-level**, so a post-3.3.0 *parameter* on a
+pre-3.3.0 class would slip through; the ones the path jobs lean on were checked by hand and both
+landed in 3.1.0 (`CrossValidator.foldCol`, `VarianceThresholdSelector`). And it runs against
+local Spark, so it catches a missing API name and nothing about Glue's runtime or IAM behaviour.
 
 Upload and create the jobs:
 
 ```bash
 aws s3 cp glue-ingest-bars.py    s3://<bucket>/crypto_ticks/scripts/
 aws s3 cp glue-refinery-path1.py s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-refinery-path2.py s3://<bucket>/crypto_ticks/scripts/
 aws s3 cp glue-refinery-path3.py s3://<bucket>/crypto_ticks/scripts/
 aws s3 cp refinery_common.py     s3://<bucket>/crypto_ticks/scripts/
 ```
@@ -568,6 +701,7 @@ Note the absence of `--local`: on Glue the master comes from the cluster.
 glue-ingest-bars.py            the Glue 4.0 entrypoint, Steps 1-3 (shared, path-blind)
 refinery_common.py             verdict(), build_session(), load_bars() -- shared by the paths
 glue-refinery-path1.py         Steps 4-10 of the continuous path, plus --self-check
+glue-refinery-path2.py         Steps 4-10 of the categorical path, plus --self-check
 glue-refinery-path3.py         Steps 4-10 of the bandit path, plus --self-check
 refinery-walkthrough.ipynb     119 cells, executed: entryway, fork, all three paths
 test_ingest_bars.py            every bar vs a pure-Decimal reference
@@ -613,10 +747,27 @@ Known gaps, stated plainly:
   freezes a `NULL` into the last bar of every month, so the target is not append-only and
   January's edge needs recomputing when February lands. Targets belong to the feature layer, over
   the concatenated series.
-- **Path 2, the DynamoDB loader and the DAG are not written.** They are prototyped in the
-  notebook, which is where their design decisions and their measured numbers live.
-  `glue-refinery-path1.py` and `glue-refinery-path3.py` are written and each matches its
-  notebook Part to the last digit.
+- **The DynamoDB loader and the DAG are not written.** All three path jobs are, and each
+  matches its notebook Part to the last digit.
+- **The correlation exports are rounded to 12 decimal places.** `Correlation.corr` is a float
+  aggregate over partitions and float addition is not associative, so the last ULP of a *pooled*
+  cell depends on how the work was scheduled — measured at up to `1.11e-16` across two launch
+  methods of the same code on the same input, while the per-symbol cells (computed on smaller
+  filtered frames) stayed put. A Pearson r carries about eight significant digits of real
+  information on this data, so 12 dp loses nothing and makes `topology/` byte-reproducible,
+  which is the property the entryway chose decimal money to protect. **Model coefficients are
+  deliberately not rounded** — masking a float difference in a fitted parameter is a different
+  thing from trimming meaningless precision off a diagnostic.
+- **Path 2's `features/` ships the StandardScaler matrix, not the search winner.** The two
+  winning-side legs are hand-rolled substitutions for transforms Spark does not ship, and
+  `percent_rank` in particular cannot carry its own training quantiles to new data — so a
+  matrix produced by it could not be reproduced on next month's bars. The search result is
+  persisted in `scaling_search/` so the divergence is visible.
+- **Path 2's quantile leg has a hard row ceiling.** `percent_rank` over an unpartitioned
+  window collapses to a single executor per column, so above 250,000 rows the leg is
+  skipped and reported. A `Bucketizer` fitted on dev quantiles would be both distributed
+  *and* a more faithful QuantileTransformer — it would carry the training boundaries across
+  — but it is a different transform and would not reproduce the notebook's measured search.
 - **Path 1's target is manufactured and its cross-validation is time-blocked, not expanding.**
   Both are stated by the job at runtime. The framework gives no rule for manufacturing a
   target, so every Path 1 verdict is conditional on nominating the next-bar log return.

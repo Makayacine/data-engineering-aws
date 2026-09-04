@@ -509,7 +509,16 @@ def step6_topology(frame):
                    "this matrix and Step 9 may not read it back -- it is exported for an "
                    "operator, not returned into the pipeline", banned=True)
 
-    return [(cols[i], cols[j], None if math.isnan(matrix[i][j]) else float(matrix[i][j]))
+    # Rounded at the export boundary. Correlation.corr is a float aggregate over partitions
+    # and float addition is not associative, so the last ULP of a pooled cell is a function of
+    # how the work happened to be scheduled -- measured: 16 of these cells move by up to
+    # 1.11e-16 between two launch methods of the SAME code on the SAME input. A Pearson r
+    # carries ~8 significant digits of real information here, so 12 decimal places loses
+    # nothing and makes the artifact byte-reproducible, which is the property the entryway
+    # chose decimal money to protect and the one a checksum gate or a backfill-vs-incremental
+    # reconciliation actually needs.
+    return [(cols[i], cols[j],
+             None if math.isnan(matrix[i][j]) else round(float(matrix[i][j]), 12))
             for i in range(len(cols)) for j in range(len(cols))]
 
 
