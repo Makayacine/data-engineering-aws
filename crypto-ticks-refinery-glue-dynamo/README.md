@@ -51,7 +51,8 @@ Airflow submits each Glue job with boto3 and polls `JobRunState`, following
 | `refinery-walkthrough.ipynb` | **done** — 119 cells, executed, all three paths |
 | `test_ingest_bars.py` | **done** — every bar checked against a `Decimal` reference |
 | `glue-refinery-path3.py` | **done** — Steps 4–10 of the bandit path, reproduces the notebook's numbers exactly |
-| `glue-refinery-path{1,2}.py` | not written — prototyped in the notebook |
+| `glue-refinery-path1.py` | **done** — Steps 4-10 of the continuous path, reproduces the notebook's numbers exactly |
+| `glue-refinery-path2.py` | not written — prototyped in the notebook |
 | `glue-dynamo.py` | not written |
 | `dag-glue-workflow.py` | not written |
 | `local-docker-development.sh` | not written |
@@ -305,6 +306,108 @@ flat share. Up and down are symmetric to within 0.6 pp on every symbol at every 
 bandit is learning tick-flatness, not alpha, and the notebook says so rather than presenting a
 confident spurious result.
 
+## Running Path 1 locally
+
+Like Path 3, Path 1 consumes **bars**, so the entryway runs first:
+
+```bash
+python glue-refinery-path1.py --local \
+    --input _localrun/bars \
+    --output _localrun/path1
+```
+
+| Prefix | Rows on the sample | What it is |
+| --- | --- | --- |
+| `features/` | 4,301 x 11 | the Step 10 scaled matrix — what Part II consumes |
+| `topology/` | 289 x 3 | Step 6's dependency schema, long-format, exported and never read back |
+| `coefficients/` | 18 x 12 | the Step 9 + Step 10 ledger, and `glue-dynamo.py`'s input |
+
+`features/` expands the scaled vector into named double columns rather than writing a
+`VectorUDT`, which round-trips through Parquet as an opaque struct only Spark understands.
+`coefficients/` carries a row for **every** column Step 8 kept, including the twelve Step 9
+zeroed — the ledger is more useful as "what happened to each candidate" than as a list of
+winners.
+
+```bash
+python glue-refinery-path1.py --self-check
+```
+
+No Spark. It pins the three pure decisions that would go wrong silently: the **strict** 5%
+firewall boundary (`>` quietly becoming `>=` swaps the entire Step 4 branch without changing a
+row count or raising anything), the inclusive fold width (drop the `+1` and the last bar lands
+in fold `K` so the `least()` clamp fires on every run, silently making the final block one row
+wide), and the basis-point back-translation that is the whole justification for Step 10's LIMIT.
+
+### What Path 1 does with each step
+
+| Step | Badge | What the job does |
+| --- | --- | --- |
+| 4 Imputation | `OVERRIDE` above 5% | measures target missingness; **both branches are implemented** |
+| 5 Diagnostics | `APPLIES` | univariate density profile — read-only, and asserted so |
+| 6 Topology | `APPLIES` | 17x17 Pearson matrix — read-only, and asserted so |
+| 7 Feature Eng | `APPLIES` | four named deterministic cross-products, 16 → 20 columns |
+| 8 Pruning | `APPLIES` | `VarianceThreshold(0.0)`; `symbol` deleted, never encoded |
+| 9 Regularisation | `APPLIES` | CV Elastic Net over 5 contiguous time-blocked folds |
+| 10 Scaling | `LIMIT` | `StandardScaler` only; mu and sigma retained |
+
+**Both Step 4 branches are implemented, and the measured rate takes the permissive one.** The
+framework demonstrates only the override and merely *states* the sub-5% branch, so a job that
+implemented what was demonstrated would do nothing at all on its own data. The threshold is
+strict in both sources (`>5%`, "exceeds the 5% firewall"), so 5.0% exactly keeps the default.
+
+**The target is manufactured.** `log(lead(close) / close)` over a window partitioned by symbol
+and ordered by `bar_us`. The framework gives no rule for manufacturing a target — NexusMart
+arrived with three genuine ones and a bar file arrives with none — so every Path 1 verdict is
+conditional on that nomination, and the job says so through `verdict()` at the fork rather than
+leaving it implied.
+
+**The cross-validation is time-blocked, not a true expanding window.** Spark's `CrossValidator`
+uses random folds by default; on ordered bars that trains on the future, and adjacent bars are
+near-duplicates so a random split puts a row and its own neighbours on both sides of the
+boundary. `foldCol` with contiguous `bar_us` blocks — keyed on the timestamp so all three
+symbols of one instant stay together — fixes the duplicate leak but **not** the direction:
+block 0 is still validated against a model trained on blocks 1-4, which are later.
+
+**Step 3's missingness flag cannot survive Path 1's Step 4, and the framework says it should.**
+`is_missing_bar` is 1 exactly when `close` is NULL, a NULL close makes the target NULL, and
+every NULL-target row is evacuated by the complete-case cut — so the column is a flat zero by
+the time Step 8 measures it, and Step 8 deletes it for having no variance. That is structural,
+not a property of one month. The LaTeX trace quietly loses the same column between Step 7 and
+Step 8 without comment. The job reports the collision instead of dropping the column silently.
+
+### Verified Path 1 run
+
+Against the committed sample, reproducing `refinery-walkthrough.ipynb` Part 2 to the last digit:
+
+```
+N/A      -- Step 4 firewall: target missingness 0.440% vs the strict 5% threshold
+APPLIES  -- Step 4 Path 1: complete-case on y (4,320 -> 4,301 rows), median impute on X (11 cells)
+APPLIES  -- Step 6 topology: 17x17 Pearson matrix, 8 pairs at |r| >= 0.90; no value changed
+APPLIES  -- Step 8 Path 1: VarianceThreshold(0.0) removed 2 columns [all_best_match, is_missing_bar]
+APPLIES  -- Step 9 Path 1: CV Elastic Net kept 6/18 columns; 12 shrunk to exactly zero
+LIMIT    -- Step 10 Path 1 LIMIT: StandardScaler over 6 columns; mu and sigma retained
+
+stage                                 rows  X cols     selected  regParam 1e-06, pure L1
+post-fork, y + base features         4,320      16     CV RMSE   0.00016487
+4  imputation                        4,301      16     target sd 0.00016641
+7  cross-products                    4,301      20
+8  VarianceThreshold(0.0)            4,301      18     back-translation, bp of next-bar return
+9  CV Elastic Net                    4,301       6       +1 sd imbalance -> +0.1196 bp
+10 StandardScaler (LIMIT)            4,301       6       +1 sd body_bp   -> +0.0440 bp
+```
+
+The CV RMSE of 0.00016487 against a target sd of 0.00016641 is a 0.9% improvement on predicting
+the mean. That is the honest read of it, and it is roughly what a next-bar return on 5-second
+crypto bars should look like.
+
+Glue 4.0 compatibility is checked by the same strip test as the other two jobs, **extended to
+`pyspark.ml`** because Path 1 is the first path that uses it: 174 names deleted (173 from
+`pyspark.sql.functions`, `predict_batch_udf` from `pyspark.ml.functions`), then re-run and
+diffed. Output identical — 123 log lines and all three Parquet payloads byte for byte. The test
+scans **classes**, so a post-3.3.0 *parameter* on a pre-3.3.0 class would slip through it; the
+two this job leans on were checked by hand and both landed in 3.1.0
+(`CrossValidator.foldCol`, `VarianceThresholdSelector`).
+
 ## Running Path 3 locally
 
 Path 3 consumes **bars**, not ticks, so the entryway runs first and Path 3 reads its output:
@@ -440,6 +543,7 @@ Note the absence of `--local`: on Glue the master comes from the cluster.
 
 ```
 glue-ingest-bars.py            the Glue 4.0 entrypoint, Steps 1-3 (shared, path-blind)
+glue-refinery-path1.py         Steps 4-10 of the continuous path, plus --self-check
 glue-refinery-path3.py         Steps 4-10 of the bandit path, plus --self-check
 refinery-walkthrough.ipynb     119 cells, executed: entryway, fork, all three paths
 test_ingest_bars.py            every bar vs a pure-Decimal reference
@@ -485,10 +589,17 @@ Known gaps, stated plainly:
   freezes a `NULL` into the last bar of every month, so the target is not append-only and
   January's edge needs recomputing when February lands. Targets belong to the feature layer, over
   the concatenated series.
-- **Path 1, Path 2, the DynamoDB loader and the DAG are not written.** They are prototyped in
-  the notebook, which is where their design decisions and their measured numbers live.
-  `glue-refinery-path3.py` is written and its output matches the notebook's Part 4 to the
-  last digit, including the seeded replay and the 200-seed summary.
+- **Path 2, the DynamoDB loader and the DAG are not written.** They are prototyped in the
+  notebook, which is where their design decisions and their measured numbers live.
+  `glue-refinery-path1.py` and `glue-refinery-path3.py` are written and each matches its
+  notebook Part to the last digit.
+- **The grid validation in `load_bars()` is duplicated between Path 1 and Path 3.** Glue
+  uploads one file per job and the filenames are hyphenated, so a shared module means
+  `--extra-py-files` on every job. At the third copy — Path 2 — that trade flips and a
+  `refinery_common.py` is worth it; at the second it is not.
+- **Path 1's target is manufactured and its cross-validation is time-blocked, not expanding.**
+  Both are stated by the job at runtime. The framework gives no rule for manufacturing a
+  target, so every Path 1 verdict is conditional on nominating the next-bar log return.
 - **Path 3's engine is a replay, not a stream, and its reward is a modelling choice.** Both
   are stated by the job at runtime, not just in prose: the arm ranking inverts between
   `close > prev` and `close >= prev`, so the ordering it produces is an ordering of
