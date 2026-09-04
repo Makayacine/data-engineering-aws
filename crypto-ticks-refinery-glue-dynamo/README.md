@@ -779,11 +779,16 @@ the serializer — does the table exist, is its key schema the one this job assu
 the parts a fake table cannot vouch for, because the test creates the fake table. That is a new
 test dependency bought for a weaker guarantee than the one boto3 already ships.
 
-One thing this job found that nothing upstream could: it is the first place all three artifacts
-meet, and they disagree. `survived_step9` is a genuine boolean on Path 1 and the strings
-`"True"`/`"False"` on Path 2. The loader logs the disagreement and ships both as written —
-retyping one here would make the table disagree with the Parquet it came from, and if an encoding
-is wrong then the path that wrote it is what needs fixing.
+One thing this job found that nothing upstream could. It is the first place all three artifacts
+meet, and when it was written they disagreed: `survived_step9` was a genuine boolean on Path 1
+and the strings `"True"`/`"False"` on Path 2. The loader reports a type disagreement rather than
+repairing one — retyping here would make the table disagree with the Parquet it came from — so
+the fix went where it belonged, `StringType` → `BooleanType` in `glue-refinery-path2.py`'s
+`COEFFICIENT_SCHEMA`. Path 2 was re-run to confirm the change was isolated: `coefficients/` is
+still 72 × 8 and every one of the 72 differing cells is that column, same truth value, while
+`features/`, `topology/` and `scaling_search/` came back identical in schema and payload. The
+check now reports nothing, which is the honest state for it rather than a reason to remove it —
+a fourth path, or a schema edit to any of the three, has nowhere else to be caught.
 
 ## Deploying to AWS Glue 4.0
 

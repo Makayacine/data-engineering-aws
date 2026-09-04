@@ -78,7 +78,8 @@ import math
 
 from pyspark.sql import Window
 from pyspark.sql import functions as func
-from pyspark.sql.types import (DoubleType, StringType, StructField, StructType)
+from pyspark.sql.types import (BooleanType, DoubleType, StringType, StructField,
+                               StructType)
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.ml.feature import (OneHotEncoder, StandardScaler, StringIndexer,
@@ -856,7 +857,10 @@ COEFFICIENT_SCHEMA = StructType([
     StructField("class_name", StringType(), False),
     StructField("coefficient", DoubleType(), False),
     StructField("max_abs_across_classes", DoubleType(), False),
-    StructField("survived_step9", StringType(), False),
+    # BooleanType, not the stringified bool an earlier version wrote. Path 1's equivalent
+    # column is a genuine boolean, and glue-dynamo.py is the first place the two artifacts
+    # meet -- where "True" and True read back differently for no reason that means anything.
+    StructField("survived_step9", BooleanType(), False),
     StructField("reg_param", DoubleType(), False),
     StructField("elastic_net_param", DoubleType(), False),
     StructField("baseline_accuracy", DoubleType(), False),
@@ -907,8 +911,10 @@ def write_outputs(spark, out, model_df, kept, scaler, topology, coefficients, we
     spark.createDataFrame(topology, TOPOLOGY_SCHEMA) \
          .coalesce(1).write.mode("overwrite").parquet(f"{base}/topology")
 
+    # weight[] is built with an explicit float(), so this comparison is a native Python bool
+    # and not the numpy.bool_ that createDataFrame would refuse against BooleanType.
     rows = [(name, CLASSES[k], float(coefficients[k][i]), weight[name],
-             str(weight[name] > 0.0), float(best[0]), float(best[1]), float(baseline))
+             weight[name] > 0.0, float(best[0]), float(best[1]), float(baseline))
             for i, name in enumerate(kept) for k in range(coefficients.shape[0])]
     spark.createDataFrame(rows, COEFFICIENT_SCHEMA) \
          .coalesce(1).write.mode("overwrite").parquet(f"{base}/coefficients")

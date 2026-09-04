@@ -370,8 +370,11 @@ def report_type_disagreements(built):
     column here would make the table disagree with the Parquet it came from, and if a path's
     encoding is wrong then the path is what needs fixing.
 
-    Measured on the committed sample, there is exactly one hit -- ``survived_step9`` is a
-    genuine boolean on Path 1 and the strings "True"/"False" on Path 2.
+    It found exactly one hit when it was written: ``survived_step9`` was a genuine boolean on
+    Path 1 and the strings "True"/"False" on Path 2. That was fixed where it belonged --
+    ``StringType`` -> ``BooleanType`` in ``glue-refinery-path2.py``'s COEFFICIENT_SCHEMA -- so
+    it now reports nothing, which is the honest state for it and not a reason to delete it: a
+    fourth path, or a schema edit to any of the three, has no other place to be caught.
     """
     types = {}
     for path, items in built.items():
