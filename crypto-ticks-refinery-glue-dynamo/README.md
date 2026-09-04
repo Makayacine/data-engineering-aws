@@ -55,7 +55,8 @@ Airflow submits each Glue job with boto3 and polls `JobRunState`, following
 | `glue-refinery-path1.py` | **done** — Steps 4-10 of the continuous path, reproduces the notebook's numbers exactly |
 | `glue-refinery-path2.py` | **done** — Steps 4-10 of the categorical path, reproduces the notebook's numbers exactly |
 | `glue-dynamo.py` | **done** — Python shell job, 96 items; designed rather than lifted, so see *What "verified" means here* |
-| `dag-glue-workflow.py` | not written |
+| `dag-glue-workflow.py` | **done** — monthly Glue workflow, DagBag-verified on Airflow 2.9.3 |
+| `test_dag_workflow.py` | **done** — the DAG's graph and two provider assumptions, no AWS |
 | `local-docker-development.sh` | not written |
 
 ## The data
@@ -790,6 +791,87 @@ still 72 × 8 and every one of the 72 differing cells is that column, same truth
 check now reports nothing, which is the honest state for it rather than a reason to remove it —
 a fourth path, or a schema edit to any of the three, has nowhere else to be caught.
 
+## The Airflow DAG
+
+`dag-glue-workflow.py` runs the whole pipeline once a month:
+
+```
+validate_raw_ticks >> check_validation >> [ingest_bars, end_dag]
+ingest_bars >> [refine_path1, refine_path2, refine_path3] >> load_dynamo
+```
+
+The three path tasks are parallel, and that is not a scheduling optimisation. The fork is the
+project's thesis: the paths share step numbers and nothing else, so a DAG that chained them
+would assert a dependency the code deliberately does not have.
+
+**The month is supplied once and reaches three places.** `glue-dynamo.py` says in its own
+docstring that its `--run-id` is supplied rather than derived, because the artifacts carry no
+month to derive it from. This is where it comes from — `data_interval_start` on an `@monthly`
+schedule, formatted once and passed to the entryway's `--month`, into the S3 prefix every path
+job writes under, and into the loader's `--run-id`. Those three *have* to agree: every job
+writes `mode("overwrite")` and none of them partitions, so a second month pointed at the same
+prefix destroys the first, and DynamoDB would hold a run-scoped history whose S3 artifacts no
+longer exist. Month-scoping the prefixes in the DAG is what keeps the table's key and the bucket
+telling the same story. `test_dag_workflow.py` asserts the agreement rather than trusting it.
+
+### What the reference lab's DAG does differently
+
+`Lab2-Airflow-Spark-Dynamo/dag-glue-workflow.py` hand-rolls its Glue polling with boto3, and
+that poller has two bugs worth naming because both are silent:
+
+- **It passes on failure.** The loop exits once the state is no longer
+  `RUNNING`/`STARTING`/`STOPPING` and then logs that the job "has finished" — so `FAILED`,
+  `TIMEOUT` and `STOPPED` all leave the loop and the task goes green. A Glue job that died hands
+  a green task to the next one, which runs against last month's artifacts.
+- **It polls the wrong run.** `get_job_runs(JobName=..., MaxResults=1)` returns the most recent
+  run of that job *name*; the `JobRunId` that `start_job_run` returned is thrown away.
+
+`GlueJobOperator` from `apache-airflow-providers-amazon` keeps the run id it started, polls that
+one, and raises on a terminal state that is not `SUCCEEDED`. That provider is already a
+dependency of this repository — the sibling `bank-marketing` DAG uses
+`EmrServerlessStartJobOperator` — so preferring the operator over hand-rolled boto3 is this
+repo's existing precedent, not a new one.
+
+**A correction, since this repo repeats the claim elsewhere.** The widely-repeated line that
+`airflow.operators.dummy_operator` and `airflow.operators.python_operator` *break DAG parsing*
+on Airflow 2.4+ is **wrong**, and it was worth measuring rather than repeating. On Airflow 2.9.3
+all of `airflow.operators.dummy_operator`, `airflow.operators.dummy`,
+`airflow.operators.python_operator`, `airflow.hooks.postgres_hook` and `airflow.utils.dates.days_ago`
+import fine, and Lab 2's DAG loads into a DagBag with **no import errors at all** — each just
+emits a `DeprecationWarning`, and `provide_context=True` a `RemovedInAirflow3Warning` that is
+otherwise ignored. They are shims scheduled for removal in Airflow 3. This DAG uses the modern
+spellings because the old ones are deprecated, not because they are broken today.
+
+`days_ago(1)` is dropped for a second reason as well: a *dynamic* `start_date` moves every time
+the scheduler re-parses the file, and this DAG derives its S3 prefixes and its DynamoDB
+partition key from the run's data interval. A key that depends on when a file was last parsed is
+not a key. `start_date` is a fixed `datetime(2025, 1, 1)`.
+
+### Verifying the DAG
+
+A DAG has no `--self-check`: it is not a program that runs, it is a graph a scheduler parses, and
+every way it can be wrong is a parse or a wiring error. `test_dag_workflow.py` is the check —
+no AWS, no network, no Airflow metadata database:
+
+```bash
+docker run --rm -v "${PWD}:/opt/airflow/proj" -w /opt/airflow/proj \
+  apache/airflow:2.9.3-python3.11 python test_dag_workflow.py
+```
+
+It asserts that the file parses into a DagBag with zero import errors, that the task graph is
+the one drawn above, that the three path tasks are wired to each other in neither direction,
+that all five Glue tasks have `wait_for_completion=True` — the reference lab's bug, asserted
+away — that `--local` reaches none of them, and that `script_args` is a template field, which is
+the one assumption in the DAG about the provider rather than about this repository. Without
+that last one the jobs would receive the literal string
+`{{ data_interval_start.strftime('%Y-%m') }}` as their `--month` and the entryway would build a
+bar calendar for a month of that name.
+
+Verified against **Airflow 2.9.3 / `apache-airflow-providers-amazon` 8.25.0** in the official
+image. It proves the DAG is well-formed. It proves nothing about Glue, IAM, or whether the jobs
+exist — there is no Airflow deployment behind this repository any more than there is an AWS
+account.
+
 ## Deploying to AWS Glue 4.0
 
 Glue 4.0 is **Spark 3.3.0 / Python 3.10 / Java 8**. The job is written to that API surface, which
@@ -916,6 +998,8 @@ glue-refinery-path1.py         Steps 4-10 of the continuous path, plus --self-ch
 glue-refinery-path2.py         Steps 4-10 of the categorical path, plus --self-check
 glue-refinery-path3.py         Steps 4-10 of the bandit path, plus --self-check
 glue-dynamo.py                 Python shell job: the three ledgers -> DynamoDB, plus --self-check
+dag-glue-workflow.py           Airflow: the monthly workflow, ingest -> fork -> load
+test_dag_workflow.py           DagBag check for the DAG -- graph, wait_for_completion, templating
 refinery-walkthrough.ipynb     119 cells, executed: entryway, fork, all three paths
 test_ingest_bars.py            every bar vs a pure-Decimal reference
 data/sample/                   2.9 MB, 356,201 real ticks, committed
@@ -966,7 +1050,11 @@ Known gaps, stated plainly:
   opened a connection. It is also the one file here with no notebook prototype to diff against —
   the walkthrough stops at the three paths — so it is designed rather than lifted, and the table
   schema is a judgement call rather than a reproduction. See *What "verified" means here*.
-- **The DAG is not written.** `dag-glue-workflow.py` and `local-docker-development.sh` remain.
+- **The DAG has never run on a scheduler.** `dag-glue-workflow.py` parses into a DagBag with no
+  import errors and its graph and operator settings are asserted by `test_dag_workflow.py`
+  against Airflow 2.9.3, but no Airflow deployment exists behind this repository, so nothing
+  here has been scheduled, triggered or retried in anger.
+- **`local-docker-development.sh` is not written.** It is the last file.
 - **The correlation exports are rounded to 12 decimal places.** `Correlation.corr` is a float
   aggregate over partitions and float addition is not associative, so the last ULP of a *pooled*
   cell depends on how the work was scheduled — measured at up to `1.11e-16` across two launch
