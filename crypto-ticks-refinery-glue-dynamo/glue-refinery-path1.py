@@ -63,7 +63,7 @@ import argparse
 import logging
 import math
 
-from pyspark.sql import SparkSession, Window
+from pyspark.sql import Window
 from pyspark.sql import functions as func
 from pyspark.sql.types import (BooleanType, DoubleType, StringType, StructField,
                                StructType)
@@ -76,6 +76,11 @@ from pyspark.ml.functions import vector_to_array
 from pyspark.ml.regression import LinearRegression
 from pyspark.ml.stat import Correlation
 from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+
+# Shared with the sibling path jobs. On Glue this needs
+#   --extra-py-files s3://<bucket>/jobs/refinery_common.py
+# Locally nothing is needed: Python puts the running script's directory on sys.path.
+from refinery_common import build_session, load_bars, verdict as _verdict
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s - %(message)s")
@@ -121,34 +126,13 @@ REQUIRED_COLS = ["symbol", "bar_us", "bar_open_time_utc",
 
 
 def verdict(applies, message, banned=False, override=False, limit=False):
-    """Section verdict. Widens the entryway's three states to the five the fork needs.
+    """Path 1's badge set, bound to this job's logger.
 
-    APPLIES  -- the check ran and there is work to do.
-    N/A      -- the check ran and found nothing. Never printed on an assumption: every N/A in
-                this job is backed by a number measured on this run.
-    OVERRIDE -- the framework's default operation is REPLACED by a different one on this path.
-    LIMIT    -- the operation runs, but a narrower version of it.
-    BANNED   -- forbidden here, and `message` is the reason, not an apology.
-
-    The notebook reports OVERRIDE and LIMIT as APPLIES with the badge named in prose, on the
-    grounds that both are narrowings of an APPLIES cell. This job gives them their own labels
-    instead: a log line is grepped, not read, and "APPLIES" on a line whose prose says LIMIT is
-    the kind of thing that survives three refactors and then misleads someone. ENFORCE is a
-    Path 2 badge and is deliberately absent -- an unused label in a helper is one somebody
-    eventually uses to mean something it does not. Same reasoning as Path 3's copy; each path
-    job carries its own verdict() because Glue uploads one file per job and the filenames are
-    hyphenated.
-
-    Returns False for BANNED as well as for N/A, so `if verdict(...):` can never gate a handler
-    the framework forbids -- the contract the entryway established.
+    Path 1 uses APPLIES / N/A / OVERRIDE (Step 4's firewall) / LIMIT (Step 10) / BANNED.
+    ENFORCE is a Path 2 badge and is not legitimate here, so it is not exposed even though
+    refinery_common.verdict() implements all five.
     """
-    label = ("BANNED   -- " if banned
-             else "OVERRIDE -- " if override
-             else "LIMIT    -- " if limit
-             else "APPLIES  -- " if applies
-             else "N/A      -- ")
-    LOG.info("%s%s", label, message)
-    return bool(applies) and not banned
+    return _verdict(applies, message, banned=banned, override=override, limit=limit, log=LOG)
 
 
 def firewall_fires(rate):
@@ -193,93 +177,6 @@ def fold_column(lo, width, folds):
     return func.least(
         func.lit(folds - 1),
         func.floor((func.col("bar_us") - func.lit(lo)) / func.lit(width))).cast("int")
-
-
-def build_session(local, shuffle_partitions):
-    """Local runs need a master and a shuffle width; Glue supplies both itself."""
-    builder = SparkSession.builder.appName(APP_NAME)
-    if local:
-        builder = builder.master("local[*]")
-        if shuffle_partitions:
-            builder = builder.config("spark.sql.shuffle.partitions", str(shuffle_partitions))
-    builder = builder.config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
-    spark = builder.getOrCreate()
-    spark.sparkContext.setLogLevel("ERROR")
-
-    # Unconditional and NOT behind --local, for the same reason as in the entryway: the session
-    # timezone defaults to the machine's, which on a dev box here is Africa/Johannesburg (UTC+2)
-    # while Glue is UTC. Path 1 does no calendar extraction, so the risk is narrower than
-    # Path 2's or Path 3's -- but bar_open_time_utc is carried into features/ and a frame whose
-    # timestamps mean different instants in two places is not a frame anyone can join to.
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
-
-    LOG.info("Spark %s | parallelism %s | tz %s | local=%s",
-             spark.version, spark.sparkContext.defaultParallelism,
-             spark.conf.get("spark.sql.session.timeZone"), local)
-    return spark
-
-
-def load_bars(spark, input_path):
-    """Read the entryway's output and prove the grid is dense before trusting lead()/lag().
-
-    Path 1's whole construction rests on "the next row IS the next bar". lead() over a SPARSE
-    grid silently returns the next bar that happens to be present, which on a grid with a hole
-    is a close from ten seconds later -- a target measured over the wrong interval, with no
-    null and no row-count change to give it away. The entryway writes a dense calendar; this
-    checks that what arrived actually is one.
-
-    Duplicated from glue-refinery-path3.py rather than shared, because Glue uploads one file
-    per job and the filenames are hyphenated. At the third copy (Path 2) it is worth a
-    refinery_common.py behind --extra-py-files; at the second it is not.
-    """
-    bars = spark.read.parquet(input_path)
-
-    missing = [c for c in REQUIRED_COLS if c not in bars.columns]
-    if missing:
-        raise ValueError(f"{input_path} is not a glue-ingest-bars.py bars frame: missing "
-                         f"{missing} -- Path 1 consumes bars, not ticks")
-
-    symbols = sorted(r[0] for r in bars.select("symbol").distinct().collect())
-    slots = bars.select("bar_us").distinct()
-    span = slots.agg(func.min("bar_us").alias("lo"), func.max("bar_us").alias("hi"),
-                     func.count("*").alias("n")).first()
-    n_slots = span["n"]
-    if n_slots < 2:
-        raise ValueError(f"{n_slots} distinct slot(s) -- a next-bar target needs a successor")
-
-    total = span["hi"] - span["lo"]
-    if total % (n_slots - 1):
-        raise ValueError(f"slot keys do not tile evenly: {total} microseconds over "
-                         f"{n_slots - 1} steps -- the bars frame is not a dense grid")
-    interval_us = total // (n_slots - 1)
-
-    # Even tiling is necessary and not sufficient: {0, 5, 10, 25} tiles at 8 and is still not a
-    # grid. pmod through expr(), NOT func.pmod -- the Python wrapper is versionadded 3.4.0 and
-    # Glue 4.0 is Spark 3.3.0, where only the SQL name is registered. `%` would compile there
-    # but maps to Remainder, which is negative for negative operands and would wave a pre-1970
-    # backfill straight through.
-    #
-    # The Glue-4.0 gate for this job is the strip test in the README: delete every name whose
-    # `versionadded` exceeds 3.3.0 from pyspark.sql.functions AND from pyspark.ml, then re-run
-    # and diff. It has one blind spot worth naming -- it scans CLASSES, so a post-3.3.0
-    # PARAMETER on a pre-3.3.0 class would survive it. The two this job leans on were checked
-    # by hand: CrossValidator.foldCol and VarianceThresholdSelector both landed in 3.1.0.
-    off_grid = slots.filter(
-        func.expr(f"pmod(bar_us - {span['lo']}, {interval_us})") != 0).count()
-    if off_grid:
-        raise ValueError(f"{off_grid} slot keys are off the {interval_us}us grid -- the bars "
-                         f"frame has holes in its calendar, which Step 3 does not produce")
-
-    rows = bars.count()
-    if rows != n_slots * len(symbols):
-        raise ValueError(f"{rows} bars is not {n_slots} slots x {len(symbols)} symbols -- the "
-                         f"grid is not dense across every symbol, so lead() would reach past a "
-                         f"gap and measure the target over the wrong interval")
-
-    LOG.info("Path 1 input: %s bars | %s slots x %s symbols %s | step %sus (%.4gs)",
-             f"{rows:,}", f"{n_slots:,}", len(symbols), symbols, f"{interval_us:,}",
-             interval_us / 1e6)
-    return bars, symbols, interval_us, rows
 
 
 # --------------------------------------------------------------------------------------
@@ -998,9 +895,15 @@ def main():
     if not args.input or not args.output:
         parser.error("--input and --output are required unless --self-check is given")
 
-    spark = build_session(args.local, args.shuffle_partitions)
+    spark = build_session(APP_NAME, args.local, args.shuffle_partitions)
     try:
-        bars, symbols, interval_us, rows = load_bars(spark, args.input)
+        bars, symbols, interval_us, n_slots, rows = load_bars(
+            spark, args.input, REQUIRED_COLS, "Path 1")
+        LOG.info("Spark %s | tz %s | local=%s", spark.version,
+                 spark.conf.get("spark.sql.session.timeZone"), args.local)
+        LOG.info("Path 1 input: %s bars | %s slots x %s symbols %s | step %sus (%.4gs)",
+                 f"{rows:,}", f"{n_slots:,}", len(symbols), symbols, f"{interval_us:,}",
+                 interval_us / 1e6)
 
         frame = fork_and_derive(bars, interval_us)
         step4, n_rows, _ = step4_imputation(frame, rows)

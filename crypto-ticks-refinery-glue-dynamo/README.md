@@ -48,6 +48,7 @@ Airflow submits each Glue job with boto3 and polls `JobRunState`, following
 | File | State |
 | --- | --- |
 | `glue-ingest-bars.py` | **done** — verified at both scales, see below |
+| `refinery_common.py` | **done** — `verdict()`, `build_session()`, `load_bars()` |
 | `refinery-walkthrough.ipynb` | **done** — 119 cells, executed, all three paths |
 | `test_ingest_bars.py` | **done** — every bar checked against a `Decimal` reference |
 | `glue-refinery-path3.py` | **done** — Steps 4–10 of the bandit path, reproduces the notebook's numbers exactly |
@@ -511,21 +512,43 @@ is narrower than the local Spark 3.5.5 in three places that matter:
 | `func.bool_and(...)` | Python wrapper is 3.5.0 | `func.expr("bool_and(...)")` |
 
 In each case the **SQL name exists in 3.3.0** and only the Python wrapper is missing, so `expr()`
-reaches it. `min_by`/`max_by` are genuinely 3.3.0 and are called directly. This is verified by
-execution, not by reading release notes: stripping all 173 post-3.3.0 wrappers from
-`pyspark.sql.functions` and re-running produces byte-identical output.
+reaches it. `min_by`/`max_by` are genuinely 3.3.0 and are called directly, and `array_compact`
+(3.4.0) has no `expr()` fallback at all — Path 3 uses explode-then-filter instead.
 
-Upload and create the job:
+This is verified by execution, not by reading release notes: every name whose `versionadded`
+exceeds 3.3.0 is deleted from `pyspark.sql.functions` **and from `pyspark.ml`**, then the job is
+re-run and diffed. Output is byte-identical in every case. The test scans **classes**, so a
+post-3.3.0 *parameter* on a pre-3.3.0 class would slip through it; the two the path jobs lean on
+were checked by hand and both landed in 3.1.0 (`CrossValidator.foldCol`,
+`VarianceThresholdSelector`).
+
+Upload and create the jobs:
 
 ```bash
-aws s3 cp glue-ingest-bars.py s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-ingest-bars.py    s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-refinery-path1.py s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp glue-refinery-path3.py s3://<bucket>/crypto_ticks/scripts/
+aws s3 cp refinery_common.py     s3://<bucket>/crypto_ticks/scripts/
 ```
 
-Create a Glue job of type Spark, Glue version 4.0, pointing at that script, with an IAM role
-holding read/write on the bucket. The job takes plain `argparse` arguments and parses them with
+Create a Glue job of type Spark, Glue version 4.0, pointing at each script, with an IAM role
+holding read/write on the bucket. The jobs take plain `argparse` arguments and parse them with
 `parse_known_args`, because Glue appends `--JOB_NAME`, `--TempDir` and friends to `sys.argv` on
 every run and a strict parser would exit 2 before Spark ever starts. No `--additional-python-modules`
-is needed: the job is pure PySpark, no pandas, no boto3, no `awsglue`.
+is needed: everything is pure PySpark plus numpy, no pandas, no boto3, no `awsglue`.
+
+**The path jobs need one extra job parameter.** `refinery_common.py` holds the verdict
+vocabulary, the session builder and the bars reader shared by all three paths, and Glue uploads
+one script per job, so it has to be put on `sys.path` explicitly:
+
+```
+--extra-py-files  s3://<bucket>/crypto_ticks/scripts/refinery_common.py
+```
+
+`glue-ingest-bars.py` does **not** need it — the entryway is self-contained, and keeping it that
+way means the shared module can change without redeploying the job that 341M ticks flow through.
+Locally nothing is needed at all: Python puts the running script's directory on `sys.path`, so
+`import refinery_common` resolves to the file next to the job.
 
 ```bash
 aws glue start-job-run --job-name crypto-ticks-ingest-bars \
@@ -543,6 +566,7 @@ Note the absence of `--local`: on Glue the master comes from the cluster.
 
 ```
 glue-ingest-bars.py            the Glue 4.0 entrypoint, Steps 1-3 (shared, path-blind)
+refinery_common.py             verdict(), build_session(), load_bars() -- shared by the paths
 glue-refinery-path1.py         Steps 4-10 of the continuous path, plus --self-check
 glue-refinery-path3.py         Steps 4-10 of the bandit path, plus --self-check
 refinery-walkthrough.ipynb     119 cells, executed: entryway, fork, all three paths
@@ -593,10 +617,6 @@ Known gaps, stated plainly:
   notebook, which is where their design decisions and their measured numbers live.
   `glue-refinery-path1.py` and `glue-refinery-path3.py` are written and each matches its
   notebook Part to the last digit.
-- **The grid validation in `load_bars()` is duplicated between Path 1 and Path 3.** Glue
-  uploads one file per job and the filenames are hyphenated, so a shared module means
-  `--extra-py-files` on every job. At the third copy — Path 2 — that trade flips and a
-  `refinery_common.py` is worth it; at the second it is not.
 - **Path 1's target is manufactured and its cross-validation is time-blocked, not expanding.**
   Both are stated by the job at runtime. The framework gives no rule for manufacturing a
   target, so every Path 1 verdict is conditional on nominating the next-bar log return.

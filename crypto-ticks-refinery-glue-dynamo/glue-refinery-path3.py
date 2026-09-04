@@ -65,10 +65,15 @@ import math
 from decimal import Decimal
 
 import numpy as np
-from pyspark.sql import SparkSession, Window
+from pyspark.sql import Window
 from pyspark.sql import functions as func
 from pyspark.sql.types import (DoubleType, LongType, StringType, StructField,
                                StructType)
+
+# Shared with the sibling path jobs. On Glue this needs
+#   --extra-py-files s3://<bucket>/jobs/refinery_common.py
+# Locally nothing is needed: Python puts the running script's directory on sys.path.
+from refinery_common import build_session, load_bars, verdict as _verdict
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s - %(message)s")
@@ -105,123 +110,20 @@ MAX_REPLAY_SLOTS = 1_000_000
 
 
 def verdict(applies, message, banned=False, override=False):
-    """Section verdict. Widens the entryway's three states to the four the fork needs.
+    """Path 3's badge set, bound to this job's logger.
 
-    APPLIES  -- the check ran and there is work to do.
-    N/A      -- the check ran and found nothing. Never printed on an assumption: every N/A in
-                this job is backed by a number measured on this run.
-    OVERRIDE -- the framework's default handling is replaced by a path-specific rule. Only
-                Step 4 uses it here, and it is reported as a pair: the OVERRIDE for the work
-                the rule DOES, a BANNED for the work it FORBIDS.
-    BANNED   -- forbidden on this path, and `message` is the reason, not an apology.
-
-    The entryway (glue-ingest-bars.py) genuinely only needs APPLIES / N/A / BANNED, so the
-    wider vocabulary is introduced here, at the fork, where the framework's own grid starts
-    using OVERRIDE / LIMIT / ENFORCE. LIMIT and ENFORCE are Path 1 and Path 2 badges and are
-    deliberately absent -- an unused label in a shared helper is a label someone eventually
-    uses to mean something it does not.
-
-    Returns False for BANNED as well as for N/A, so `if verdict(...):` can never gate a
-    handler the framework forbids -- the same contract the entryway established.
+    Path 3 uses APPLIES / N/A / OVERRIDE (Step 4) / BANNED (Steps 4, 6, 8, 9, 10). LIMIT is a
+    Path 1 badge and ENFORCE a Path 2 badge; neither is legitimate on this path, so neither is
+    exposed here even though refinery_common.verdict() implements all five.
     """
-    label = ("BANNED   -- " if banned
-             else "OVERRIDE -- " if override
-             else "APPLIES  -- " if applies
-             else "N/A      -- ")
-    LOG.info("%s%s", label, message)
-    return bool(applies) and not banned
+    return _verdict(applies, message, banned=banned, override=override, log=LOG)
 
 
-def build_session(local, shuffle_partitions):
-    """Local runs need a master and a shuffle width; Glue supplies both itself."""
-    builder = SparkSession.builder.appName(APP_NAME)
-    if local:
-        builder = builder.master("local[*]")
-        if shuffle_partitions:
-            builder = builder.config("spark.sql.shuffle.partitions", str(shuffle_partitions))
-    builder = builder.config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
-    spark = builder.getOrCreate()
-    spark.sparkContext.setLogLevel("ERROR")
-
-    # Unconditional and NOT behind --local, for the same reason as in the entryway: the
-    # session timezone defaults to the machine's, which on a dev box here is
-    # Africa/Johannesburg (UTC+2) while Glue is UTC. Step 6 reads hour() and minute() straight
-    # off bar_open_time_utc, so without this line the HOUR_xx tokens -- and therefore every
-    # support, confidence and lift figure the frame ever produces -- shift by two hours between
-    # the two places. The instant is right in both; every calendar extraction is wrong in one.
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
-
-    LOG.info("Spark %s | parallelism %s | tz %s | local=%s",
-             spark.version, spark.sparkContext.defaultParallelism,
-             spark.conf.get("spark.sql.session.timeZone"), local)
-    return spark
+REQUIRED_COLS = ["symbol", "bar_us", "bar_open_time_utc", "close", "volume", "taker_buy_qty",
+                 "n_ticks", "is_missing_bar", "all_best_match"]
 
 
-def load_bars(spark, input_path):
-    """Read the entryway's output and recover the two things Path 3 needs from its shape.
-
-    The arms and the bar width are DERIVED from the input rather than passed as flags. Both
-    are properties of the frame that was actually written, and a flag is a second place for
-    them to be wrong: a --symbols list that disagrees with the data silently drops an arm from
-    the pivot, and a --bar-interval that disagrees turns Step 5's stream diagnostic into a
-    statement about nothing. Deriving them also makes the grid checks below possible at all.
-    """
-    bars = spark.read.parquet(input_path)
-
-    missing = [c for c in ("symbol", "bar_us", "bar_open_time_utc", "close", "volume",
-                           "taker_buy_qty", "n_ticks", "is_missing_bar", "all_best_match")
-               if c not in bars.columns]
-    if missing:
-        raise ValueError(f"{input_path} is not a glue-ingest-bars.py bars frame: missing "
-                         f"{missing} -- Path 3 consumes bars, not ticks")
-
-    arms = sorted(r[0] for r in bars.select("symbol").distinct().collect())
-    if not arms:
-        raise ValueError(f"{input_path} holds no rows -- there is nothing to replay")
-
-    # The grid, validated rather than assumed. Step 3 wrote a dense calendar, and every later
-    # step here leans on that: lag() over bar_us is only a "previous bar" if the slots are
-    # contiguous, the replay's arrival order is only chronological if the step is constant, and
-    # the interaction frame is only one transaction per instant if every arm shares the grid.
-    slots = bars.select("bar_us").distinct()
-    span = slots.agg(func.min("bar_us").alias("lo"), func.max("bar_us").alias("hi"),
-                     func.count("*").alias("n")).first()
-    n_slots = span["n"]
-    if n_slots < 2:
-        raise ValueError(f"{n_slots} distinct slot(s) -- a replay needs a series")
-    total = span["hi"] - span["lo"]
-    if total % (n_slots - 1):
-        raise ValueError(f"slot keys do not tile evenly: {total} microseconds over "
-                         f"{n_slots - 1} steps -- the bars frame is not a dense grid")
-    interval_us = total // (n_slots - 1)
-
-    # Even tiling is necessary and not sufficient: {0, 5, 10, 25} tiles at 8 and is still not a
-    # grid. pmod through expr(), NOT func.pmod -- the Python wrapper is versionadded 3.4.0 and
-    # Glue 4.0 is Spark 3.3.0, where only the SQL name is registered. Same rule as
-    # timestamp_micros and bool_and in the entryway; this is the fourth instance of it, not an
-    # exception to it. `%` would compile on 3.3.0 but maps to Remainder, which is negative for
-    # negative operands and so would pass a pre-1970 backfill straight through.
-    off_grid = slots.filter(
-        func.expr(f"pmod(bar_us - {span['lo']}, {interval_us})") != 0).count()
-    if off_grid:
-        raise ValueError(f"{off_grid} slot keys are off the {interval_us}us grid -- the bars "
-                         f"frame has holes in its calendar, which Step 3 does not produce")
-
-    rows = bars.count()
-    if rows != n_slots * len(arms):
-        raise ValueError(f"{rows} bars is not {n_slots} slots x {len(arms)} arms -- the grid "
-                         f"is not dense across every symbol and lag() would silently compare "
-                         f"a bar against a non-adjacent one")
-
-    LOG.info("Path 3 input: %s bars | %s slots x %s arms %s | step %sus (%.4gs)",
-             f"{rows:,}", f"{n_slots:,}", len(arms), arms, f"{interval_us:,}",
-             interval_us / 1e6)
-    LOG.info("gamma=%s (per pull, ~%.0f pulls of memory = ~%.1f minutes at this bar width)",
-             GAMMA, 1 / (1 - GAMMA), interval_us / 1e6 / (1 - GAMMA) / 60)
-    return bars, arms, interval_us, n_slots, rows
-
-
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------
 # STEP 4 -- IMPUTATION  (OVERRIDE: maintain native missingness)
 # --------------------------------------------------------------------------------------
 
@@ -937,9 +839,17 @@ def main():
     if not args.input or not args.output:
         parser.error("--input and --output are required unless --self-check is given")
 
-    spark = build_session(args.local, args.shuffle_partitions)
+    spark = build_session(APP_NAME, args.local, args.shuffle_partitions)
     try:
-        bars, arms, interval_us, n_slots, rows = load_bars(spark, args.input)
+        bars, arms, interval_us, n_slots, rows = load_bars(
+            spark, args.input, REQUIRED_COLS, "Path 3")
+        LOG.info("Spark %s | tz %s | local=%s", spark.version,
+                 spark.conf.get("spark.sql.session.timeZone"), args.local)
+        LOG.info("Path 3 input: %s bars | %s slots x %s arms %s | step %sus (%.4gs)",
+                 f"{rows:,}", f"{n_slots:,}", len(arms), arms, f"{interval_us:,}",
+                 interval_us / 1e6)
+        LOG.info("gamma=%s (per pull, ~%.0f pulls of memory = ~%.1f minutes at this bar width)",
+                 GAMMA, 1 / (1 - GAMMA), interval_us / 1e6 / (1 - GAMMA) / 60)
 
         step4_native_missingness(bars, rows)
 
