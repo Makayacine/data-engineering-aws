@@ -1,0 +1,13 @@
+# Everything the local pipeline produces. _localrun/ holds the DuckDB source database, the
+# watermark JSON that stands in for DynamoDB, and the raw landing zone -- all of it rebuilt in
+# seconds from the committed data/adcontentworth_qje.tab.gz, and none of it worth a diff.
+_localrun/
+
+# The CSVs build_source_db.py writes for the MySQL LOAD DATA blocks. They are a reshaping of
+# data/adcontentworth_qje.tab.gz, which is already committed, so committing them too would put
+# the same rows in the repository twice and give a future edit two places to disagree.
+mysql/data/
+
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -1,0 +1,79 @@
+{
+  "Comment": "Chain, not Parallel: each table has one fixed S3 key, overwritten every run.",
+  "Version": "1.0",
+  "StartAt": "ExtractMailOffers",
+  "States": {
+    "ExtractMailOffers": {
+      "Type": "Task",
+      "Comment": "Incremental: WHERE wave > last_extracted_value. Run 4 extracts 0 rows.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "mysql-extraction-job",
+        "Arguments": {
+          "--table_name": "mail_offers",
+          "--load_type": "incremental"
+        }
+      },
+      "Next": "RawIngestMailOffers"
+    },
+    "RawIngestMailOffers": {
+      "Type": "Task",
+      "Comment": "Must finish before the next extract overwrites this table's data.csv.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "redshift-raw-ingestion",
+        "Arguments": {
+          "--table_name": "mail_offers",
+          "--bucket": "credit-mailer-lab",
+          "--iam-role": "arn:aws:iam::<account-id>:role/RedshiftCopyRole"
+        }
+      },
+      "Next": "ExtractClientAttributes"
+    },
+    "ExtractClientAttributes": {
+      "Type": "Task",
+      "Comment": "load_column is NULL, so full_load: a CRM snapshot has no event time.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "mysql-extraction-job",
+        "Arguments": {
+          "--table_name": "client_attributes",
+          "--load_type": "full_load"
+        }
+      },
+      "Next": "RawIngestClientAttributes"
+    },
+    "RawIngestClientAttributes": {
+      "Type": "Task",
+      "Comment": "All 58,168 rows every run. Same fixed key, same ordering constraint.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "redshift-raw-ingestion",
+        "Arguments": {
+          "--table_name": "client_attributes",
+          "--bucket": "credit-mailer-lab",
+          "--iam-role": "arn:aws:iam::<account-id>:role/RedshiftCopyRole"
+        }
+      },
+      "Next": "ProcessedLayer"
+    },
+    "ProcessedLayer": {
+      "Type": "Task",
+      "Comment": "Needs both raw tables: the fact joins mail_offers to client_attributes.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "redshift-processed-layer-ingestion"
+      },
+      "Next": "BanditRefineryPath3"
+    },
+    "BanditRefineryPath3": {
+      "Type": "Task",
+      "Comment": "Steps 4-10, then the bandit replay over the star it has just filled.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "credit-mailer-refinery-path3"
+      },
+      "End": true
+    }
+  }
+}

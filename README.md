@@ -24,6 +24,9 @@ rather than drift. `bank-marketing-cleaning-emr-redshift` adds `redshift/` for t
 `crypto-ticks-refinery-glue-dynamo` adds `tests/` and a `local-docker-development.sh` that runs
 the whole chain inside AWS's own Glue 4.0 image, and keeps its notebook at the project root
 because every path in it is written relative to there.
+`credit-mailer-watermark-glue-redshift` has **no `airflow-dag/` at all** — it is orchestrated by
+Step Functions, so `step-functions/` takes that slot — and adds `mysql/` for the source database
+it extracts from and `dynamodb/` for the one control-plane table that holds its load state.
 
 The notebook is kept deliberately. It is where the logic was worked out, and it carries the
 executed outputs, so the production job can be diffed against something that is known to be
@@ -119,10 +122,66 @@ again about arithmetic and determinism rather than plumbing:
 
 Full detail, the per-path step tables and every verified figure are in the project README.
 
+### `credit-mailer-watermark-glue-redshift`
+
+Incremental ETL over a South African consumer-lender field experiment — 58,168 direct mail loan
+offers sent in three waves in 2003, each at a randomly assigned interest rate, from
+Bertrand et al.'s QJE 2010 replication deposit (CC0).
+
+The lesson is the watermark, and what makes it a lesson is the asymmetry: the load state lives in
+DynamoDB, one row per table, and one of the two source tables **cannot** be loaded incrementally.
+A pipeline where every table has a timestamp would not need this — a hard-coded predicate would
+do. `client_attributes` is a CRM snapshot with no event column anywhere in it, so its
+`load_column` is `None` and it ships all 58,168 rows on every run.
+
+```
+MySQL  ->  Glue Python Shell  ->  S3 landing  ->  Redshift raw_zone  ->  processed_zone star
+           (watermark in DynamoDB)                                              |
+                                                                        Path 3: the bandit
+```
+
+Everything is a Glue **Python Shell** job — the standard library, boto3 and numpy, no pandas and
+no Spark. The largest extract is 58,168 rows of 7 columns, and a cluster would spend longer
+starting than the whole chain takes.
+
+| Run | Source holds | `mail_offers` extracts | Watermark after |
+| --- | --- | --- | --- |
+| 1 | wave 1 | 4,974 | `1` |
+| 2 | waves 1-2 | 20,996 | `2` |
+| 3 | waves 1-3 | 32,198 | `3` |
+| 4 | waves 1-3 | **0** | `3`, unchanged |
+
+Run 4 is the point. A job that ignored the stored value would extract all 58,168 rows and look
+healthy doing it — same exit code, same object, same duration. The row count is the only thing
+that separates them.
+
+The analytical half is Path 3 of the same ten-step framework, and only Path 3: the geometry of
+`y` allows nothing else. `amountbrw_unc` is zero on 92.47% of rows, and `badacct_last` exists only
+for the 4,381 people who got a loan. What the file does have is an action that was genuinely
+randomised, which makes the off-policy evaluation causal rather than decorative.
+
+- **The file reproduces the paper exactly.** Waves 2 and 3 are 53,194 rows, which is the paper's
+  published N; mean rate 793 basis points against its "793"; 87.2% of applications became loans
+  against its "87%"; and the maximum rate offered in each risk band is the lender's own standard
+  schedule to the cent. That is the provenance check, and it is cheaper than trusting a filename.
+- **One of six off-policy comparisons clears zero**, and it is the band where the arms separate:
+  HIGH risk on wave 3, +11.78%, CI95 [+0.0025, +0.0091], with best and worst arms 6.7 posterior
+  standard deviations apart. Take-up falls from 5.76% on the cheapest arm to 4.08% on the
+  dearest, though not monotonically — arms 3 and 4 are inverted by well under one posterior sd.
+- **One came out negative.** LOW risk on wave 3, -9.62% — the policy trained on the earlier waves
+  did worse than the lender's own randomisation. LOW's top three arms are within one standard
+  deviation of each other and its greedy arm never settles, moving 1 -> 2 -> 0 across the rounds.
+  A confident policy over arms that do not separate is an overconfident one.
+
+Full detail, the verified figures and the three banned steps are in the project README.
+
+
 ## Running anything here
 
-Each project's README carries its own prerequisites. In general you need Python 3.11,
-`pyspark==3.5.5`, and a Java 11 or 17 JDK on `JAVA_HOME` — Spark 3.5 does not support Java 21+.
+Each project's README carries its own prerequisites. For the two Spark projects you need
+Python 3.11, `pyspark==3.5.5`, and a Java 11 or 17 JDK on `JAVA_HOME` — Spark 3.5 does not support
+Java 21+. `credit-mailer-watermark-glue-redshift` needs none of that: it is Python Shell
+throughout, so `pip install -r requirements.txt` and a `duckdb>=1.4` is the whole prerequisite.
 The Spark jobs take a `--local` flag that runs them against plain filesystem paths, so every
 project can be exercised end to end without an AWS account.
 

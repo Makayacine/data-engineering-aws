@@ -1,0 +1,35 @@
+# Local path -- what it takes to run the whole pipeline on a laptop with no AWS account.
+#
+# duckdb stands in for BOTH ends: MySQL as the source database, Redshift as the warehouse.
+# The version floor is the entire reason it can: DuckDB 1.4 added
+#   MERGE INTO ... WHEN MATCHED / WHEN NOT MATCHED
+# which is the one Redshift statement this pipeline actually depends on. With it, the ingestion
+# jobs run the real MERGE text locally instead of a rewritten equivalent, so the statement that
+# can silently corrupt the warehouse is the same statement in both places rather than two
+# statements believed to agree. An earlier duckdb will install and then fail at the MERGE, which
+# is a worse failure than a resolver error, hence the floor rather than a note.
+duckdb>=1.4
+pandas
+numpy
+pytest
+
+# AWS path -- NOT installed by this file, and deliberately not listed above.
+#
+# Every job here is a Glue **Python Shell** job, not Spark. boto3 is preinstalled in that
+# runtime, so pinning it locally would be pinning a version the job will not use. The other two
+# are not preinstalled and are supplied to the job itself:
+#
+#   --additional-python-modules pymysql,redshift_connector
+#
+#   boto3               preinstalled by the Glue Python Shell runtime. Reads the watermark from
+#                       DynamoDB and writes the extract to S3.
+#   pymysql             the source connection in glue-jobs/mysql-extraction.py. Pure Python, so
+#                       it installs into a Python Shell job without a wheel-compatibility fight;
+#                       mysqlclient would need a C build the runtime has no compiler for.
+#   redshift_connector  the warehouse connection. Chosen over psycopg2 because it speaks
+#                       Redshift's own protocol extensions and is Amazon's supported driver;
+#                       the Postgres wire protocol works until it meets something Redshift-only.
+#
+# pymysql and redshift_connector are left out of the install above rather than added "just in
+# case": nothing on the --local path opens either connection, and a dependency that is installed
+# but never imported is one that rots quietly until the day somebody needs it to work.
