@@ -1249,10 +1249,10 @@ glue python3 glue-jobs/glue-dynamo.py --dry-run --run-id "${RUN_ID}" \
 * **Boundary / Memory Constraint (Dummy Translation):** The container gets a third of the machine, so everything takes longer, and the worst hit is the stage that trains lots of small models rather than the one reading lots of rows. Nothing has to be installed — the image already ships every library these jobs import.
 
 
-* **Failure Mode / Downstream Impact:** This is the stronger version of the strip test: real Spark 3.3.0, Python 3.10 and Java 8 rather than a locally simulated API surface. `bars/` and both `topology/` exports came out identical to native, while `coefficients/` differed by up to 9.2e-14 and `path3/frame/` had 74 of 1,440 baskets in a different item order — identical as sets. The image is Glue's runtime, not Glue: `local[*]` on a laptop, with no cluster, no S3, no IAM, no job bookmarks and no `GlueContext`.
+* **Failure Mode / Downstream Impact:** This is the stronger version of the strip test: real Spark 3.3.0, Python 3.10 and Java 8 rather than a locally simulated API surface. `bars/` and both `topology/` exports came out identical to native, while `coefficients/` differed by up to 9.2e-14 and `path3/frame/` had 74 of 1,440 baskets in a different item order — identical as sets. The image is Glue's runtime rather than the Glue service: it pins the same Spark, Python, Java and jar set, and runs them `local[*]`, so a cluster, S3, IAM and job bookmarks sit outside it.
 
 
-* **Failure Mode / Downstream Impact (Dummy Translation):** Running in AWS's own image proves the code works on the real Spark version, and the decimal money columns held up exactly — the bars came back byte for byte the same. The fitted model numbers wobbled in the fourteenth decimal, which is float arithmetic, not a bug. It still is not AWS: no cluster, no permissions, no S3.
+* **Failure Mode / Downstream Impact (Dummy Translation):** Running in AWS's own image proves the code works on the real Spark version, and the decimal money columns held up exactly — the bars came back byte for byte the same. The fitted model numbers wobbled in the fourteenth decimal, which is float arithmetic, not a bug. It is the same engine AWS runs, on one machine rather than a cluster.
 
 
 

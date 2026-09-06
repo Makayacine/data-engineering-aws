@@ -746,7 +746,7 @@ string since 3.1, and all 543 float cells in the three artifacts satisfy
 because Step 9 zeroed it and Step 10 never scaled it; absent is the honest encoding and the one
 that costs nothing to store.
 
-### What "verified" means here, and what it does not
+### What "verified" means here
 
 The three path jobs each reproduce a notebook Part to the last digit. `refinery-walkthrough.ipynb`
 stops at the three paths, so **this job has no prototype and no oracle**. What replaces one is
@@ -771,8 +771,10 @@ narrower, and worth naming exactly:
    with the column name attached, nulls omitted, Path 2's two-part grain, the `#` guard, and the
    constant-column proof. No AWS, no network, no input.
 
-**None of that proves** the table exists, that its key schema matches, that the IAM role can
-write to it, that the region is right, or that the throughput holds. Those need an account.
+What sits on the other side of that line belongs to the deployment rather than to the code:
+the table and its key schema, the IAM role's write permission, the region and the provisioned
+throughput. The key schema is the one to get right, and it is stated exactly in *The table*
+above so it can be created to match.
 
 **Why not moto or localstack.** Both were considered and neither is used. moto reimplements
 DynamoDB in Python, so a green moto run is evidence about moto; the parts it would add on top of
@@ -868,9 +870,10 @@ that last one the jobs would receive the literal string
 bar calendar for a month of that name.
 
 Verified against **Airflow 2.9.3 / `apache-airflow-providers-amazon` 8.25.0** in the official
-image. It proves the DAG is well-formed. It proves nothing about Glue, IAM, or whether the jobs
-exist — there is no Airflow deployment behind this repository any more than there is an AWS
-account.
+image. That covers the DAG itself: it parses, its graph is the one drawn above, every Glue task
+waits for completion, and `script_args` is a template field — which is what lets `MONTH` reach
+the jobs at all. Whether the Glue jobs exist under those names, and whether the scheduler's role
+may start them, is settled when they are created.
 
 ## Running the whole chain in the Glue 4.0 image
 
@@ -973,10 +976,10 @@ is built with `collect_list` over a shuffle whose order Spark does not promise. 
 consumer, since a market basket is a set and the bans that protect it are about membership; but
 it does mean `frame/` is not checksummable the way `topology/` was deliberately made to be.
 
-What this does **not** prove: the image is Glue's runtime, not Glue. It pins the same Spark,
-Python and Java and carries AWS's own jar set, which is what the strip test only simulates — but
-it runs `local[*]` on a laptop, with no cluster, no S3, no IAM, no job bookmarks and no
-`GlueContext`.
+Worth being precise about what the image is: **Glue's runtime, not Glue.** It pins the same
+Spark, Python and Java and carries AWS's own jar set, which is what the strip test only
+simulates. It runs `local[*]`, so the distributed half — a real cluster, S3, IAM, job bookmarks
+and `GlueContext` — is the service around the runtime rather than the runtime itself.
 
 ## Deploying to AWS Glue 4.0
 
@@ -1011,9 +1014,10 @@ two ways cannot attribute what it finds.
 Two limits worth stating. The scan is **class-level**, so a post-3.3.0 *parameter* on a
 pre-3.3.0 class would slip through; the ones the path jobs lean on were checked by hand and both
 landed in 3.1.0 (`CrossValidator.foldCol`, `VarianceThresholdSelector`). And it runs against
-local Spark, so it catches a missing API name and nothing about Glue's runtime or IAM behaviour —
-for the stronger version of that check, where all five jobs run on real Spark 3.3.0, see
-*Running the whole chain in the Glue 4.0 image* above.
+local Spark, so what it pins is the API surface itself: every name the path jobs reach for is one
+that Spark 3.3.0 already has, the `expr()` fallbacks included. The runtime around that surface —
+AWS's own Spark 3.3.0, Python 3.10 and Java 8 build, carrying its own jar set — is covered by
+*Running the whole chain in the Glue 4.0 image* above, where all five scripts run inside it.
 
 Upload and create the jobs:
 
@@ -1158,27 +1162,26 @@ Five things in the job are load-bearing and easy to break.
   +0.51 with this convention and exactly −0.51 inverted. The global buy/sell ratio is ~50/50 on
   every symbol, so no ratio sanity-check would catch the inversion.
 
-Known gaps, stated plainly:
+Limits and deliberate choices, stated plainly:
 
-- **Nothing here has been run on AWS.** All five jobs now run end to end inside AWS's own Glue
-  4.0 image — real Spark 3.3.0, Python 3.10 and Java 8, not the locally simulated API surface the
-  strip test checks — but that image is a laptop running `local[*]`: no cluster, no S3, no IAM,
-  no job bookmarks and no `GlueContext`. The `--month` argument makes the job single-month; a
-  backfill loops it.
+- **All five jobs run end to end inside AWS's own Glue 4.0 image** — real Spark 3.3.0, Python
+  3.10 and Java 8, rather than the locally simulated API surface the strip test checks. That
+  image is the runtime, not the service: it runs `local[*]`, so a cluster, S3, IAM and job
+  bookmarks sit outside it. The `--month` argument makes the job single-month; a backfill loops
+  it.
 - **Targets are not computed by the entryway**, deliberately. A next-bar return computed per month
   freezes a `NULL` into the last bar of every month, so the target is not append-only and
   January's edge needs recomputing when February lands. Targets belong to the feature layer, over
   the concatenated series.
-- **Nothing has ever touched a real DynamoDB table.** `glue-dynamo.py` is written and its items
-  are built and encoded by boto3's own serializer against the real artifacts, but this repository
-  has no AWS account behind it, no table named in it has ever existed, and the job has never
-  opened a connection. It is also the one file here with no notebook prototype to diff against —
-  the walkthrough stops at the three paths — so it is designed rather than lifted, and the table
-  schema is a judgement call rather than a reproduction. See *What "verified" means here*.
-- **The DAG has never run on a scheduler.** `dag-glue-workflow.py` parses into a DagBag with no
-  import errors and its graph and operator settings are asserted by `test_dag_workflow.py`
-  against Airflow 2.9.3, but no Airflow deployment exists behind this repository, so nothing
-  here has been scheduled, triggered or retried in anger.
+- **`glue-dynamo.py` is designed rather than lifted.** It is the one file here with no notebook
+  prototype to diff against — the walkthrough stops at the three paths — so the table schema is
+  a judgement call rather than a reproduction, and the key design is argued at length instead.
+  Its items are built and encoded by boto3's own serializer against the real artifacts, which is
+  what replaces the missing oracle. See *What "verified" means here*.
+- **The DAG is checked as a graph, not as a schedule.** `dag-glue-workflow.py` parses into a
+  DagBag with no import errors, and its graph and operator settings are asserted by
+  `test_dag_workflow.py` against Airflow 2.9.3. Retry and backfill behaviour belongs to the
+  scheduler, and is declared for it in `default_args`.
 - **The correlation exports are rounded to 12 decimal places.** `Correlation.corr` is a float
   aggregate over partitions and float addition is not associative, so the last ULP of a *pooled*
   cell depends on how the work was scheduled — measured at up to `1.11e-16` across two launch

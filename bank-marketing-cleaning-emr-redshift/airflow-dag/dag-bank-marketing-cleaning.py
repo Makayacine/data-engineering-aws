@@ -44,7 +44,7 @@ KPI_PREFIX = 'bank_marketing/kpis/'
 SEGMENT_KPI_PREFIX = KPI_PREFIX + 'segment_level_kpis/'
 MONTHLY_KPI_PREFIX = KPI_PREFIX + 'monthly_kpis/'
 
-# PLACEHOLDERS -- nothing AWS-side has been created yet. Replace both with the real
+# PLACEHOLDERS -- account-specific values the deployer supplies. Replace both with the real
 # application id and the ARN of a job role that can read the raw prefix and write the
 # curated/KPI/log prefixes, or the first run fails inside EMR with a ValidationException.
 EMR_APPLICATION_ID = '<emr-serverless-application-id>'

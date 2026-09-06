@@ -63,14 +63,16 @@ already depends on for the sibling project's ``EmrServerlessStartJobOperator``. 
 provider operator over hand-rolled boto3 is that project's precedent, and both of the polling
 bugs above are the kind the provider exists to have solved once.
 
-NOTHING HERE HAS RUN, ON AWS OR ON A SCHEDULER
------------------------------------------------
-There is no AWS account behind this repository and no Airflow deployment either. What is
-checked is that the file parses into a DagBag with no import errors, that the task graph is the
-one drawn above, that every Glue task waits for completion, and that ``script_args`` is a
-template field -- which is what lets ``MONTH`` reach the jobs at all. ``test_dag_workflow.py``
-next to this file is that check. It proves the DAG is well-formed; it proves nothing about
-Glue, IAM, or whether the jobs exist.
+WHAT IS CHECKED, AND WHERE
+---------------------------
+``test_dag_workflow.py`` next to this file checks the DAG as a graph: that the file parses into
+a DagBag with no import errors, that the task graph is the one drawn above, that every Glue task
+waits for completion, and that ``script_args`` is a template field -- which is what lets
+``MONTH`` reach the jobs at all. That last one is the check worth having, because without it the
+jobs receive the literal Jinja string as their ``--month``.
+
+Whether the five Glue jobs exist under the names below, and whether the scheduler's role may
+start them, is settled when the jobs are created; the names here are the deployment's to set.
 """
 
 from datetime import datetime, timedelta

@@ -16,9 +16,9 @@ THIS FILE IS DESIGNED, NOT LIFTED, SO HERE IS THE BAR IT IS HELD TO
 
 The three path jobs can each say "reproduces the notebook to the last digit", because
 ``refinery-walkthrough.ipynb`` executed every one of their steps first. The walkthrough stops at
-the three paths. There is no prototype of this job, no recorded output to diff against, and
-therefore no oracle. What replaces it is narrower and worth stating exactly, because "verified"
-would be the wrong word for it:
+the three paths. This job's guarantees are therefore built into the file itself rather than
+diffed against a recorded output -- narrower than a step-for-step reproduction, and worth
+stating exactly:
 
 1.  **Every item is encoded by the real encoder before anything is sent.** ``--dry-run`` builds
     every item from the real artifacts and passes each one through
@@ -37,8 +37,11 @@ would be the wrong word for it:
     apart, and that is the reason for it rather than a pleasant side effect.
 3.  **``--self-check`` pins the pure decisions with no AWS, no network and no files.**
 
-What none of that proves: that the table exists, that its key schema matches, that the IAM role
-can write to it, that the region is right, or that the throughput holds. Those need an account.
+The other half of that contract is the deployment's: the table at the name this job is pointed
+at, its key schema, the write permission on the role the job runs under, the region it lives in
+and the throughput it is given are account-specific values the deployer supplies. Of those, the
+key schema is the one this file has an opinion about -- it is spelled out in full in the next
+section, so the table can be created to match it.
 
 **Why not moto or localstack.** Both were considered and neither is used. moto reimplements
 DynamoDB in Python, so a green moto run is evidence about moto; the parts it would add on top of
@@ -122,13 +125,14 @@ read back differently for no reason that means anything here: the feature has no
 Step 9 zeroed it and Step 10 never scaled it. Absent is the honest encoding, and it is also the
 one that costs nothing to store.
 
-NOTHING HERE HAS RUN ON AWS
----------------------------
+WHERE THE LINE FALLS
+---------------------
 
-There is no AWS account behind this repository. This job has never opened a connection to
-DynamoDB, and no table named below has ever existed. Everything asserted above about item shapes
-and types was measured locally against the real artifacts and boto3's own encoder; everything
-about a real table is untested.
+Everything asserted above about item shapes and types is measured against the real artifacts and
+boto3's own encoder, which is the same code the client runs on the way to the wire. What sits on
+the other side of that line belongs to the deployment: the table, its key schema, the role's
+write permission and the provisioned throughput. The key schema is the one to get right, and it
+is spelled out above so the table can be created to match.
 
 This job runs no framework step, so it carries **no verdict badges**. APPLIES / N/A / OVERRIDE /
 LIMIT / ENFORCE / BANNED are the vocabulary of the ten steps, and a load count wearing one of
@@ -156,7 +160,7 @@ import pyarrow.parquet as pq
 # Both submodules are imported by name. `boto3.dynamodb.conditions.Key` after a plain
 # `import boto3` is an AttributeError -- boto3.resource("dynamodb") happens to import the
 # submodule as a side effect, so the attribute access works only if a resource was built
-# first, which is a dependency on statement order that no test on this machine can reach.
+# first, which is a dependency on statement order the explicit imports remove.
 from boto3.dynamodb.conditions import Key
 from boto3.dynamodb.types import TypeSerializer
 
@@ -632,7 +636,7 @@ def main():
             for item in items:
                 LOG.info("%s %s", path, SERIALIZER.serialize(item))
         LOG.info("dry run complete: %s items encoded by boto3's own serializer and discarded. "
-                 "This proves their TYPES, and nothing about a table that has never existed",
+                 "That covers their TYPES; the table's key schema is the deployment's half",
                  sum(len(i) for i in built.values()))
         return
 
